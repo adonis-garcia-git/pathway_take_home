@@ -41,7 +41,7 @@ export default defineSchema({
 
   menus: defineTable({
     restaurantId: v.id("restaurants"),
-    sourceType: v.union(v.literal("url"), v.literal("image"), v.literal("text")),
+    sourceType: v.union(v.literal("url"), v.literal("image"), v.literal("text"), v.literal("pdf")),
     rawSource: v.string(),
     parsedAt: v.optional(v.number()),
   }).index("by_restaurantId", ["restaurantId"]),
