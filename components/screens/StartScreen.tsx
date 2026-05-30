@@ -3,6 +3,10 @@
 import React, { useRef, useState } from "react";
 import { Link2, AlignLeft, Upload, MapPin, Play, FileText, Sprout, Tag, Send, Award } from "lucide-react";
 import { cn, Button, IconField, TextArea, Segmented, LinkButton, Patty, PattyAvatar } from "@/components/ui";
+import { useMutation } from "convex/react";
+import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
+import { DevPipelineStatus } from "@/components/DevPipelineStatus";
 
 const SAMPLE_MENU = `TRATTORIA LUCIA — Menu
 
@@ -27,6 +31,22 @@ export function StartScreen({ onRun }: { onRun: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [address, setAddress] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // TODO(phase 7): remove this dev-only block.
+  const seed = useMutation(api.seed.seedTrattoriaLucia);
+  const start = useMutation(api.pipelineRuns.startPipeline);
+  const [devRunId, setDevRunId] = useState<Id<"pipelineRuns"> | null>(null);
+  const [devError, setDevError] = useState<string | null>(null);
+  const runSkeleton = async () => {
+    setDevError(null);
+    try {
+      const { runId } = await seed();
+      setDevRunId(runId);
+      await start({ runId });
+    } catch (e) {
+      setDevError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const hasMenu = (mode === "url" && url.trim()) || (mode === "text" && text.trim()) || (mode === "upload" && file);
   const ready = hasMenu && address.trim();
@@ -88,6 +108,26 @@ export function StartScreen({ onRun }: { onRun: () => void }) {
             <p className="m-0 text-[13px] leading-relaxed text-muted">Every number is tagged with where it came from — <b className="text-ink font-medium">USDA-verified</b>, <b className="text-ink font-medium">estimated</b>, or <b className="text-ink font-medium">no data</b>. Patty flags anything that needs a human.</p>
           </div>
         </aside>
+      </div>
+
+      {/* TODO(phase 7): remove. Dev verification for Phase 1 orchestration. */}
+      <div className="mt-10 pt-8 border-t border-dashed border-border-strong/40">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <div className="text-[11px] font-semibold tracking-[0.09em] uppercase text-muted">
+              Dev · Phase 1 verification
+            </div>
+            <p className="text-[13px] text-muted mt-1">
+              Seeds a Trattoria Lucia restaurant + pipelineRun, then schedules the 5 stage stubs.
+              Watch the steps transition pending → running → done in real time via Convex reactivity.
+            </p>
+          </div>
+          <Button variant="primary" size="md" onClick={runSkeleton}>
+            <Play size={14} /> Run skeleton pipeline
+          </Button>
+        </div>
+        {devError && <p className="text-[13px] text-st-error mb-2">{devError}</p>}
+        {devRunId && <DevPipelineStatus runId={devRunId} />}
       </div>
     </div>
   );
