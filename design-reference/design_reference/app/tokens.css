@@ -1,0 +1,235 @@
+/* ============================================================
+   Pathway RFP Pipeline — Design Tokens
+   Brand: deep-forest primary, #57BD86 Patty sparkle, cream+white
+   Type: Geist (UI) · Geist Mono (data) · Newsreader (serif accent)
+   ============================================================ */
+
+:root {
+  /* ---- Brand greens ---- */
+  --patty: #57BD86;            /* sparkle accent */
+  --patty-ink: #3f9e6a;        /* darker patty for text-on-light */
+  --forest: oklch(25% 0.08 152);   /* ~#16432B primary */
+  --forest-hi: oklch(31% 0.085 152);
+  --forest-lo: oklch(20% 0.07 152);
+  --sage: oklch(80% 0.08 152);     /* ~#A8D9BE */
+  --mint: oklch(96.5% 0.018 152);  /* ~#F1F7F3 near-white green */
+  --mint-deep: #E6F3E6;
+
+  /* ---- Surfaces ---- */
+  --cream: #FFFBEB;
+  --paper: #ffffff;
+  --paper-2: #FCFCFA;          /* faint warm panel */
+  --paper-3: #F7F6F1;
+
+  /* ---- Ink / text ---- */
+  --ink: #16130d;              /* warm near-black */
+  --ink-2: #3a352c;
+  --muted: #6b6256;            /* warm muted */
+  --muted-2: #938a7c;
+  --faint: #b8b0a2;
+
+  /* ---- Borders ---- */
+  --border: #E9E5DA;           /* warm hairline */
+  --border-2: #DED9CC;
+  --border-strong: #cabf ad;
+
+  /* ---- Status hues (color + meaning) ---- */
+  --st-pending: #94908a;       /* neutral grey */
+  --st-pending-bg: #F1EFEA;
+  --st-running: #2E8FD6;       /* info blue — "alive" */
+  --st-running-bg: #E8F3FC;
+  --st-done: #2E9E6B;          /* success green */
+  --st-done-bg: #E7F5EE;
+  --st-error: #D6492E;         /* destructive */
+  --st-error-bg: #FBEAE6;
+  --st-warn: #C0820B;          /* amber — needs attention */
+  --st-warn-bg: #FBF2DC;
+
+  /* ---- Provenance ---- */
+  --pv-verified: #2E9E6B;      /* USDA verified */
+  --pv-verified-bg: #E7F5EE;
+  --pv-estimated: #8A6FB0;     /* estimated — violet, distinct from status */
+  --pv-estimated-bg: #F1ECF7;
+  --pv-nodata: #94908a;        /* no data — grey */
+  --pv-nodata-bg: #F1EFEA;
+
+  /* ---- Confidence ---- */
+  --cf-high: #2E9E6B;
+  --cf-med: #C0820B;
+  --cf-low: #D6492E;
+
+  /* ---- Trend ---- */
+  --trend-up: #D6492E;         /* price up = bad for buyer (red) */
+  --trend-down: #2E9E6B;       /* price down = good (green) */
+  --trend-flat: #94908a;
+
+  /* ---- Radius ---- */
+  --r-xs: 7px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 18px;
+  --r-xl: 24px;
+  --r-pill: 999px;
+
+  /* ---- Shadows (soft, low) ---- */
+  --sh-1: 0 1px 2px rgba(22,19,13,0.04), 0 1px 1px rgba(22,19,13,0.03);
+  --sh-2: 0 2px 4px rgba(22,19,13,0.05), 0 4px 12px rgba(22,19,13,0.04);
+  --sh-3: 0 8px 24px rgba(22,19,13,0.08), 0 2px 6px rgba(22,19,13,0.05);
+  --sh-pop: 0 18px 48px rgba(22,19,13,0.16), 0 4px 12px rgba(22,19,13,0.08);
+  --ring: 0 0 0 3px color-mix(in oklch, var(--forest) 22%, transparent);
+
+  /* ---- Type ---- */
+  --font-ui: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-serif: "Newsreader", ui-serif, Georgia, serif;
+
+  /* ---- Layout ---- */
+  --maxw: 1280px;
+  --rail: 248px;
+}
+
+/* fix typo'd token above without re-deriving */
+:root { --border-strong: #CABFAD; }
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--cream);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-feature-settings: "cv01", "ss01";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.mono { font-family: var(--font-mono); font-feature-settings: "tnum" 1, "zero" 1; }
+.serif { font-family: var(--font-serif); }
+.tnum { font-variant-numeric: tabular-nums; }
+
+::selection { background: var(--sage); color: var(--forest-lo); }
+
+/* Scrollbars — quiet */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: #d9d3c6; border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background: #c5bdac; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   Buttons
+   ============================================================ */
+.btn {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 540;
+  line-height: 1;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  padding: 11px 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: background .16s ease, box-shadow .16s ease, transform .08s ease, border-color .16s ease, color .16s ease;
+  white-space: nowrap;
+  user-select: none;
+}
+.btn:active { transform: translateY(0.5px); }
+.btn:focus-visible { outline: none; box-shadow: var(--ring); }
+
+.btn-primary { background: var(--forest); color: #fff; box-shadow: var(--sh-1); }
+.btn-primary:hover { background: var(--forest-hi); box-shadow: var(--sh-2); }
+.btn-primary:disabled { background: #b9c4bc; color: #eef2ef; cursor: not-allowed; box-shadow: none; }
+
+.btn-secondary { background: var(--mint); color: var(--forest); border-color: color-mix(in oklch, var(--forest) 12%, transparent); }
+.btn-secondary:hover { background: var(--mint-deep); }
+
+.btn-ghost { background: transparent; color: var(--ink-2); border-color: var(--border); }
+.btn-ghost:hover { background: var(--paper-3); border-color: var(--border-2); }
+
+.btn-quiet { background: transparent; color: var(--muted); padding: 8px 10px; }
+.btn-quiet:hover { background: var(--paper-3); color: var(--ink); }
+
+.btn-lg { font-size: 16px; padding: 15px 24px; border-radius: var(--r-lg); }
+.btn-sm { font-size: 12.5px; padding: 7px 11px; border-radius: var(--r-sm); gap: 6px; }
+.btn-block { width: 100%; justify-content: center; }
+
+/* ============================================================
+   Cards / surfaces
+   ============================================================ */
+.card {
+  background: var(--paper);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-1);
+}
+.card-pad { padding: 20px; }
+.card-flush { box-shadow: none; }
+
+.hairline { border: 1px solid var(--border); }
+
+/* ============================================================
+   Inputs
+   ============================================================ */
+.field {
+  font-family: var(--font-ui);
+  font-size: 14.5px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-md);
+  padding: 12px 14px;
+  width: 100%;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.field::placeholder { color: var(--faint); }
+.field:focus { outline: none; border-color: var(--forest); box-shadow: var(--ring); }
+textarea.field { resize: vertical; line-height: 1.55; }
+
+/* ============================================================
+   Animations
+   ============================================================ */
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--st-running) 40%, transparent); }
+  70% { box-shadow: 0 0 0 10px color-mix(in oklch, var(--st-running) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--st-running) 0%, transparent); }
+}
+@keyframes shimmer {
+  0% { background-position: -180% 0; }
+  100% { background-position: 180% 0; }
+}
+@keyframes rise {
+  from { transform: translateY(9px); }
+  to { transform: translateY(0); }
+}
+@keyframes fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes dash-flow {
+  to { stroke-dashoffset: -1000; }
+}
+.rise { animation: rise .4s cubic-bezier(.22,.61,.36,1) both; }
+.fade { animation: fade .3s ease both; }
+
+/* Skeleton */
+.sk {
+  background: linear-gradient(90deg, #efece4 25%, #f7f5f0 50%, #efece4 75%);
+  background-size: 220% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: var(--r-sm);
+}
+
+/* utility */
+.row { display: flex; align-items: center; }
+.col { display: flex; flex-direction: column; }
+.gap-4 { gap: 4px; } .gap-6 { gap: 6px; } .gap-8 { gap: 8px; }
+.gap-10 { gap: 10px; } .gap-12 { gap: 12px; } .gap-16 { gap: 16px; } .gap-20 { gap: 20px; } .gap-24 { gap: 24px; }
+.grow { flex: 1; }
+.wrap { flex-wrap: wrap; }
+.between { justify-content: space-between; }
+.center { justify-content: center; }
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }

@@ -1,0 +1,105 @@
+/* app/globals.css — Tailwind v4 theme + base for Pathway RFP Pipeline
+   Tailwind v4: `@import "tailwindcss";` then `@theme { … }` registers
+   utilities (bg-forest, text-ink, rounded-lg, shadow-sh1, font-serif…). */
+@import "tailwindcss";
+
+@theme {
+  /* surfaces */
+  --color-background: #FFFBEB;
+  --color-surface: #FFFFFF;
+  --color-surface-2: #FCFCFA;
+  --color-surface-3: #F7F6F1;
+  --color-border: #E9E5DA;
+  --color-border-strong: #CABFAD;
+
+  /* text */
+  --color-ink: #16130D;
+  --color-ink-2: #3A352C;
+  --color-muted: #6B6256;
+  --color-faint: #B8B0A2;
+
+  /* brand */
+  --color-forest: oklch(25% 0.08 152);
+  --color-forest-hi: oklch(31% 0.085 152);
+  --color-forest-lo: oklch(20% 0.07 152);
+  --color-patty: #57BD86;
+  --color-patty-ink: #3F9E6A;
+  --color-sage: #A8D9BE;
+  --color-mint: #F1F7F3;
+  --color-mint-deep: #E6F3E6;
+
+  /* status fg/bg */
+  --color-st-pending: #94908A;   --color-st-pending-bg: #F1EFEA;
+  --color-st-running: #2E8FD6;   --color-st-running-bg: #E8F3FC;
+  --color-st-done: #2E9E6B;      --color-st-done-bg: #E7F5EE;
+  --color-st-error: #D6492E;     --color-st-error-bg: #FBEAE6;
+  --color-st-warn: #C0820B;      --color-st-warn-bg: #FBF2DC;
+
+  /* provenance */
+  --color-pv-verified: #2E9E6B;  --color-pv-verified-bg: #E7F5EE;
+  --color-pv-estimated: #8A6FB0; --color-pv-estimated-bg: #F1ECF7;
+  --color-pv-nodata: #94908A;    --color-pv-nodata-bg: #F1EFEA;
+
+  /* confidence */
+  --color-cf-high: #2E9E6B;
+  --color-cf-med: #C0820B;
+  --color-cf-low: #D6492E;
+
+  /* trend */
+  --color-trend-up: #D6492E;
+  --color-trend-down: #2E9E6B;
+  --color-trend-flat: #94908A;
+
+  /* category */
+  --color-cat-produce: #3F9E6A;
+  --color-cat-dairy: #C0820B;
+  --color-cat-meat: #B5524A;
+  --color-cat-seafood: #2E8FD6;
+  --color-cat-drygoods: #8A6FB0;
+
+  /* fonts (wire to next/font/google CSS variables) */
+  --font-sans: var(--font-geist, "Geist"), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono, "Geist Mono"), ui-monospace, monospace;
+  --font-serif: var(--font-newsreader, "Newsreader"), ui-serif, Georgia, serif;
+
+  /* radii */
+  --radius-xs: 7px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+
+  /* shadows */
+  --shadow-sh1: 0 1px 2px rgb(22 19 13 / .04), 0 1px 1px rgb(22 19 13 / .03);
+  --shadow-sh2: 0 2px 4px rgb(22 19 13 / .05), 0 4px 12px rgb(22 19 13 / .04);
+  --shadow-sh3: 0 8px 24px rgb(22 19 13 / .08), 0 2px 6px rgb(22 19 13 / .05);
+  --shadow-pop: 0 18px 48px rgb(22 19 13 / .16), 0 4px 12px rgb(22 19 13 / .08);
+
+  /* motion */
+  --ease-rise: cubic-bezier(.22,.61,.36,1);
+}
+
+@layer base {
+  html, body { background: var(--color-background); color: var(--color-ink); }
+  body { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+  ::selection { background: var(--color-sage); color: var(--color-forest-lo); }
+  .tnum { font-variant-numeric: tabular-nums; }
+}
+
+/* keyframes (transform-only entrance — never opacity-gate content) */
+@keyframes rise { from { transform: translateY(9px); } to { transform: translateY(0); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { 0% { background-position: -180% 0; } 100% { background-position: 180% 0; } }
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-st-running) 40%, transparent); }
+  70%  { box-shadow: 0 0 0 10px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.animate-rise { animation: rise .42s var(--ease-rise) both; }
+.skeleton {
+  background: linear-gradient(90deg, #efece4 25%, #f7f5f0 50%, #efece4 75%);
+  background-size: 220% 100%; animation: shimmer 1.4s ease-in-out infinite; border-radius: 10px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-rise, .skeleton { animation: none; }
+}
