@@ -1,10 +1,15 @@
 import { v } from "convex/values";
-import { internalAction, internalMutation } from "./_generated/server";
+import { internalAction, internalMutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
 import { replyAddressFor } from "./lib/replyAddress";
-import { placesTextSearch, type PlacesResult } from "./lib/places";
+import {
+  placesTextSearch,
+  type PlacesResult,
+  DEFAULT_SEARCH_RADIUS_METERS,
+  WIDE_SEARCH_RADIUS_METERS,
+} from "./lib/places";
 
 // ── types ──────────────────────────────────────────────────────────
 
@@ -268,17 +273,36 @@ export const discoverFromPlaces = internalAction({
 
     let newCount = 0;
     let existingCount = 0;
+    let widenedCategories = 0;
+    const MIN_RESULTS_PER_CATEGORY = 3;
 
     for (const category of PLACES_CATEGORIES) {
       const textQuery = QUERY_TEMPLATES[category](address);
 
       let results: PlacesResult[];
       try {
-        results = await placesTextSearch(textQuery, { lat, lng });
+        results = await placesTextSearch(textQuery, { lat, lng }, {
+          radiusMeters: DEFAULT_SEARCH_RADIUS_METERS,
+        });
       } catch (e) {
-        // Don't fail the whole stage on one bad category — log and continue.
         console.error(`[places] query failed for ${category}:`, e);
         continue;
+      }
+
+      // Sparse category — try once more with a wider radius. Avoids the
+      // "zero distributors in this category" failure mode in less-dense areas.
+      if (results.length < MIN_RESULTS_PER_CATEGORY) {
+        try {
+          const wider = await placesTextSearch(textQuery, { lat, lng }, {
+            radiusMeters: WIDE_SEARCH_RADIUS_METERS,
+          });
+          if (wider.length > results.length) {
+            results = wider;
+            widenedCategories += 1;
+          }
+        } catch (e) {
+          console.warn(`[places] widen-radius pass failed for ${category}:`, e);
+        }
       }
 
       for (const place of results) {
@@ -309,6 +333,82 @@ export const discoverFromPlaces = internalAction({
       distinctPlaces: seen.size,
       newDistributors: newCount,
       existingDistributors: existingCount,
+      widenedCategories,
     };
   },
 });
+
+// ── Public reactive query: feeds DistributorsPanel ─────────────────
+
+/** Haversine distance in miles between two lat/lng pairs. */
+function distanceMiles(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
+  if (a.lat === 0 && a.lng === 0) return 0;
+  if (b.lat === 0 && b.lng === 0) return 0;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const R = 3958.7613;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+export const getDistributorsForRun = query({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const run = await ctx.db.get(runId);
+    if (!run) return null;
+    const restaurant = await ctx.db.get(run.restaurantId);
+    if (!restaurant) return null;
+
+    // Prefer the distributors that actually got RFPs (rfpRecipients exists).
+    // Fallback: scan all distributors (find_distributors step ran but RFP not yet created).
+    let distributorIds: Set<Id<"distributors">> = new Set();
+    if (run.rfpId) {
+      const recipients = await ctx.db
+        .query("rfpRecipients")
+        .withIndex("by_rfpId", (q) => q.eq("rfpId", run.rfpId!))
+        .collect();
+      for (const r of recipients) distributorIds.add(r.distributorId);
+    }
+
+    let docs: Doc<"distributors">[];
+    if (distributorIds.size > 0) {
+      docs = [];
+      for (const id of distributorIds) {
+        const d = await ctx.db.get(id);
+        if (d) docs.push(d);
+      }
+    } else {
+      docs = await ctx.db.query("distributors").collect();
+    }
+    if (docs.length === 0) return null;
+
+    const restaurantCenter = { lat: restaurant.lat, lng: restaurant.lng };
+    const out = [];
+    for (const d of docs) {
+      const cats = await ctx.db
+        .query("distributorCategories")
+        .withIndex("by_distributorId", (q) => q.eq("distributorId", d._id))
+        .collect();
+      const categories = cats.map((c) => c.category);
+      const distanceMi = distanceMiles(restaurantCenter, { lat: d.lat, lng: d.lng });
+      const provLabel: "verified" | "estimated" = d.source === "google_places" ? "verified" : "estimated";
+      out.push({
+        ...d,
+        categories,
+        distanceMi: Math.round(distanceMi * 10) / 10,
+        provLabel,
+        sourceTag: d.source === "google_places" ? "Google Places" : "Mock catalog",
+      });
+    }
+    // closest first
+    out.sort((a, b) => a.distanceMi - b.distanceMi);
+    // cap to 20 for UI clarity
+    return out.slice(0, 20);
+  },
+});
+

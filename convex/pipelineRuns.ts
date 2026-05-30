@@ -18,6 +18,21 @@ export const getPipelineRun = query({
   handler: async (ctx, { runId }) => ctx.db.get(runId),
 });
 
+export const getPipelineRunHeader = query({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (
+    ctx,
+    { runId },
+  ): Promise<{ restaurantName: string; address: string; rfpShortCode: string | null } | null> => {
+    const run = await ctx.db.get(runId);
+    if (!run) return null;
+    const restaurant = await ctx.db.get(run.restaurantId);
+    if (!restaurant) return null;
+    const rfpShortCode = run.rfpId ? `RFP-${run.rfpId.toString().slice(-4).toUpperCase()}` : null;
+    return { restaurantName: restaurant.name, address: restaurant.address, rfpShortCode };
+  },
+});
+
 export const startPipeline = mutation({
   args: { runId: v.id("pipelineRuns") },
   handler: async (ctx, { runId }) => {

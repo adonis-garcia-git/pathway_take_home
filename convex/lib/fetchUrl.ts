@@ -1,19 +1,36 @@
 // Fetch a URL and reduce it to plain text. We intentionally avoid jsdom /
 // readability to keep the dep graph small — Claude is robust enough to parse
 // noisy menu pages once script/style/comments are dropped.
+import { fetchWithTimeout, HttpError, withRetry } from "./net";
+
 export async function fetchUrlAsText(url: string): Promise<string> {
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      Accept: "text/html,application/xhtml+xml",
-      "User-Agent": "PathwayRfpBot/0.1 (+https://workwithpathway.com)",
+  const html = await withRetry(
+    async () => {
+      const res = await fetchWithTimeout(url, {
+        method: "GET",
+        timeoutMs: 15_000,
+        label: `fetchUrl(${url})`,
+        headers: {
+          Accept: "text/html,application/xhtml+xml",
+          "User-Agent": "PathwayRfpBot/0.1 (+https://workwithpathway.com)",
+        },
+      });
+      if (!res.ok) {
+        throw new HttpError(`fetchUrl(${url})`, res.status, await safeBody(res));
+      }
+      return await res.text();
     },
-  });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch menu URL ${url}: ${res.status} ${res.statusText}`);
-  }
-  const html = await res.text();
+    { attempts: 2, baseMs: 400, label: `fetchUrl(${url})` },
+  );
   return stripHtml(html);
+}
+
+async function safeBody(res: Response): Promise<string | undefined> {
+  try {
+    return (await res.text()).slice(0, 200);
+  } catch {
+    return undefined;
+  }
 }
 
 export function stripHtml(html: string): string {

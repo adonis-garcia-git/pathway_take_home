@@ -85,3 +85,85 @@ export type DishExtraction = z.infer<typeof DishExtractionSchema>;
 export type IngredientExtraction = z.infer<typeof IngredientExtractionSchema>;
 export type Confidence = z.infer<typeof Confidence>;
 export type Category = z.infer<typeof Category>;
+
+// ── Quote reply extraction (Phase 6) ───────────────────────────────
+
+export const QuoteLineSchema = z.object({
+  rawName: z
+    .string()
+    .describe("Exact line text as written by the distributor (e.g. 'San Marzano tomatoes — $3.20/lb')."),
+  canonicalName: z
+    .string()
+    .describe(
+      "Singular, lowercased common noun for dedup matching against our basket. Same normalization as menu extraction: 'San Marzano tomatoes' → 'tomato'; 'EVOO' → 'olive oil'.",
+    ),
+  price: z
+    .number()
+    .nonnegative()
+    .nullable()
+    .describe("Per-unit price quoted. Null if the distributor said unavailable or didn't give a number for this line."),
+  unit: z
+    .string()
+    .optional()
+    .describe("Unit the price applies to: 'lb', 'each', 'case', 'gal', 'doz'."),
+  available: z
+    .boolean()
+    .describe("False if the distributor said they don't carry the item or it's out of stock."),
+  note: z
+    .string()
+    .optional()
+    .describe("Free-text the distributor wrote about this line: substitution offers, minimum order, lead-time caveat, etc."),
+});
+
+export const QuoteExtractionSchema = z.object({
+  lines: z
+    .array(QuoteLineSchema)
+    .describe(
+      "Every basket line the distributor responded to, in any order. Include lines they said unavailable for (available:false). Skip pleasantries.",
+    ),
+  deliveryTerms: z
+    .string()
+    .optional()
+    .describe("Verbatim delivery cadence: 'Mon/Thu', 'daily 6×/wk', '2-day lead', etc."),
+  paymentTerms: z
+    .string()
+    .optional()
+    .describe("Verbatim payment terms: 'Net-30', 'Net-15', 'COD', 'Prepaid', etc."),
+  leadTime: z
+    .string()
+    .optional()
+    .describe("Lead time if stated separately from delivery cadence."),
+  totalPrice: z
+    .number()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .describe("Total weekly basket value if the distributor stated one. Null/undefined if they only quoted per-line."),
+  missingInfo: z
+    .boolean()
+    .describe(
+      "True if ANY requested basket item is absent from the reply OR a quoted line is missing its price. Triggers an autonomous follow-up.",
+    ),
+  parseConfidence: z
+    .enum(["high", "medium", "low"])
+    .describe("How confident you are this extraction faithfully reflects the distributor's intent."),
+});
+
+export type QuoteExtraction = z.infer<typeof QuoteExtractionSchema>;
+
+// ── Recommendation rationale (Phase 6) ─────────────────────────────
+
+export const RecommendationRationaleSchema = z.object({
+  headline: z
+    .string()
+    .describe(
+      "One-sentence award decision, max ~90 chars. Example: 'Award core basket to Lombardi; pair Hudson for veal.'",
+    ),
+  rationale: z
+    .string()
+    .describe(
+      "2–3 sentences justifying the pick grounded in price, completeness, and terms. Mention gaps or risks if any.",
+    ),
+});
+
+export type RecommendationRationale = z.infer<typeof RecommendationRationaleSchema>;

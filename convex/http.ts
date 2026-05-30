@@ -41,6 +41,14 @@ http.route({
     // Spam: ack with 200 so Maileroo doesn't retry; no side-effects.
     if (payload.is_spam) return new Response("ok (spam)", { status: 200 });
 
+    // DMARC: drop unauthenticated mail. Without this any sender could
+    // impersonate one of our distributors with a forged From and flip an
+    // rfpRecipient to "replied". The Zod schema defaults the field to false
+    // when missing, so we explicitly require true.
+    if (!payload.is_dmarc_aligned) {
+      return new Response("ok (dmarc unaligned)", { status: 200 });
+    }
+
     // Find the matching rfpRecipients row by walking recipients[].
     const replyAddress = payload.recipients.find(
       (addr) => distributorIdFromReplyAddress(addr) !== null,

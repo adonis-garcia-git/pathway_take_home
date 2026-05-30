@@ -12,13 +12,14 @@
 // real DNS by calling the same recordInboundQuote mutation the webhook uses.
 
 import { v } from "convex/values";
-import { internalAction, internalMutation, action } from "./_generated/server";
+import { internalAction, internalMutation, action, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
 import { replyAddressFor } from "./lib/replyAddress";
 import { sendBasicEmail } from "./lib/maileroo";
 import { buildRfpHtml, buildRfpSubject, type RfpLine } from "./lib/rfpTemplate";
+import { sumOccurrences } from "./lib/units";
 import { STEPS } from "./lib/stepKeys";
 
 // ─── Internal mutations: idempotent recipient writes ────────────────
@@ -127,6 +128,11 @@ export const attachRfpToRun = internalMutation({
   handler: async (ctx, { runId, rfpId }) => {
     const run = await ctx.db.get(runId);
     if (!run) return;
+    // Don't clobber a previously attached RFP — re-attaching the same id is
+    // a no-op; a different id is almost certainly a bug we'd rather surface
+    // than silently overwrite.
+    if (run.rfpId && run.rfpId !== rfpId) return;
+    if (run.rfpId === rfpId) return;
     await ctx.db.patch(runId, { rfpId });
   },
 });
@@ -191,6 +197,13 @@ export const runSendRfps = internalAction({
       runId,
     });
     if (!run) return { summary: "run not found", rfpId: null };
+
+    // Idempotency: if a previous attempt already created an RFP for this run,
+    // resume from there instead of inserting a second one. A crash between
+    // createRfp and attachRfpToRun would otherwise duplicate the RFP row.
+    if (run.rfpId) {
+      return { summary: "rfp already created (resumed)", rfpId: run.rfpId };
+    }
 
     const restaurant: Doc<"restaurants"> | null = await ctx.runQuery(
       internal.email.getRestaurant,
@@ -314,9 +327,15 @@ export const aggregateBasket = internalQuery({
       .query("menus")
       .withIndex("by_restaurantId", (q) => q.eq("restaurantId", restaurantId))
       .collect();
-    const summary = new Map<
+    // Two passes: first collect every per-dish occurrence keyed by ingredientId,
+    // then sum with unit-aware aggregation (so 0.5 lb + 8 oz tomatoes → 1 lb).
+    const occurrences = new Map<
       string,
-      { ingredientId: Id<"ingredients">; quantity: number; unit: string; rawName: string }
+      {
+        ingredientId: Id<"ingredients">;
+        rawName: string;
+        rows: { qty: number; unit: string }[];
+      }
     >();
     for (const menu of menus) {
       const dishes = await ctx.db
@@ -330,19 +349,31 @@ export const aggregateBasket = internalQuery({
           .collect();
         for (const di of dishIngs) {
           const key = di.ingredientId as unknown as string;
-          const prev = summary.get(key);
+          const prev = occurrences.get(key);
           if (prev) {
-            prev.quantity = Math.round((prev.quantity + di.estimatedQuantity) * 10) / 10;
+            prev.rows.push({ qty: di.estimatedQuantity, unit: di.unit });
           } else {
-            summary.set(key, {
+            occurrences.set(key, {
               ingredientId: di.ingredientId,
-              quantity: di.estimatedQuantity,
-              unit: di.unit,
               rawName: di.rawName,
+              rows: [{ qty: di.estimatedQuantity, unit: di.unit }],
             });
           }
         }
       }
+    }
+    const summary = new Map<
+      string,
+      { ingredientId: Id<"ingredients">; quantity: number; unit: string; rawName: string }
+    >();
+    for (const [key, entry] of occurrences) {
+      const totaled = sumOccurrences(entry.rows);
+      summary.set(key, {
+        ingredientId: entry.ingredientId,
+        quantity: totaled.qty,
+        unit: totaled.unit,
+        rawName: entry.rawName,
+      });
     }
     const out: BasketLine[] = [];
     for (const entry of summary.values()) {
@@ -433,9 +464,15 @@ export const checkCollectQuotesDone = internalAction({
     }
 
     const missing = recipients.length - terminal.length;
+
+    // Generate the final recommendation BEFORE marking the step done so the
+    // UI sees the recommendation ready the moment currentStep flips to "done".
+    // Action is idempotent (upsert on by_runId).
+    await ctx.runAction(internal.agent.generateRecommendation, { runId });
+
     const summary = allDone
-      ? `${replied} quotes · ${terminal.length - replied} no reply`
-      : `${replied} quotes · ${missing} no reply (partial)`;
+      ? `${replied} quotes · ${terminal.length - replied} no reply · recommendation ready`
+      : `${replied} quotes · ${missing} no reply (partial) · recommendation ready`;
 
     await ctx.runMutation(internal.pipelineRuns.markStepDone, {
       runId,
@@ -474,6 +511,107 @@ export const findRunByRfp = internalQuery({
 });
 
 // ─── Dev simulator: bypass HTTP/Zod, write through recordInboundQuote ──
+
+// ─── Public reactive query: feeds RfpPanel ──────────────────────────
+
+export const getRfpThreadsForRun = query({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const run = await ctx.db.get(runId);
+    if (!run || !run.rfpId) return null;
+    const rfp = await ctx.db.get(run.rfpId);
+    if (!rfp) return null;
+    const restaurant = await ctx.db.get(run.restaurantId);
+    if (!restaurant) return null;
+
+    const mailDomain = optional("MAIL_DOMAIN") ?? "example.local";
+    const fromAddress = `Patty (${restaurant.name}) <rfp@${mailDomain}>`;
+
+    const recipients = await ctx.db
+      .query("rfpRecipients")
+      .withIndex("by_rfpId", (q) => q.eq("rfpId", rfp._id))
+      .collect();
+    if (recipients.length === 0) return null;
+
+    // Build ingredient lookup once.
+    const ingredientById = new Map<
+      string,
+      { canonicalName: string; category: Doc<"ingredients">["category"]; defaultUnit: string }
+    >();
+    for (const line of rfp.ingredientList) {
+      if (!ingredientById.has(line.ingredientId as unknown as string)) {
+        const ing = await ctx.db.get(line.ingredientId);
+        if (ing) {
+          ingredientById.set(line.ingredientId as unknown as string, {
+            canonicalName: ing.canonicalName,
+            category: ing.category,
+            defaultUnit: ing.defaultUnit,
+          });
+        }
+      }
+    }
+
+    const subject = buildRfpSubject(restaurant.name);
+
+    const threads = [];
+    for (const r of recipients) {
+      const dist = await ctx.db.get(r.distributorId);
+      if (!dist) continue;
+      const cats = await ctx.db
+        .query("distributorCategories")
+        .withIndex("by_distributorId", (q) => q.eq("distributorId", dist._id))
+        .collect();
+      const distCategories = new Set(cats.map((c) => c.category));
+      const rfpItems = rfp.ingredientList
+        .filter((line) => {
+          const ing = ingredientById.get(line.ingredientId as unknown as string);
+          return ing && distCategories.has(ing.category);
+        })
+        .map((line) => {
+          const ing = ingredientById.get(line.ingredientId as unknown as string)!;
+          return {
+            ingredientId: line.ingredientId,
+            rawName: ing.canonicalName,
+            qty: line.quantity,
+            unit: line.unit,
+          };
+        });
+
+      threads.push({
+        recipientId: r._id,
+        distributorId: dist._id,
+        distributorName: dist.name,
+        distributorPhone: dist.phone ?? null,
+        status: r.emailStatus,
+        sentAt: r.sentAt ?? null,
+        repliedAt: r.repliedAt ?? null,
+        attempts: r.attempts,
+        note: r.note ?? null,
+        rfpItems,
+        subject,
+        fromAddress,
+        toAddress: dist.email,
+      });
+    }
+
+    // Order: replied → sent → followed_up → queued → failed (UI-friendly)
+    const statusOrder: Record<string, number> = {
+      replied: 0,
+      sent: 1,
+      followed_up: 2,
+      queued: 3,
+      failed: 4,
+    };
+    threads.sort((a, b) => (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9));
+
+    return {
+      deadline: rfp.deadline,
+      restaurantName: restaurant.name,
+      restaurantAddress: restaurant.address,
+      threads,
+    };
+  },
+});
 
 export const simulateInboundReply = action({
   args: {

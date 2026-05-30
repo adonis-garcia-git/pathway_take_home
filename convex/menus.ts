@@ -4,6 +4,7 @@ import {
   internalMutation,
   internalQuery,
   mutation,
+  query,
 } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -12,6 +13,7 @@ import { aggregateIngredients, type ParsedDish } from "./lib/aggregate";
 import { extractMenu, type MenuContent } from "./lib/anthropic";
 import { fetchUrlAsText } from "./lib/fetchUrl";
 import type { MenuExtraction } from "./lib/schemas";
+import { sumOccurrences } from "./lib/units";
 
 // ── public mutations ───────────────────────────────────────────────
 
@@ -70,6 +72,120 @@ export const createFromMenu = mutation({
     });
 
     return { restaurantId, menuId, runId };
+  },
+});
+
+// ── public: reactive query feeding RecipesPanel ────────────────────
+
+export const getRecipesForRun = query({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const run = await ctx.db.get(runId);
+    if (!run || !run.menuId) return null;
+    const dishes = await ctx.db
+      .query("dishes")
+      .withIndex("by_menuId", (q) => q.eq("menuId", run.menuId!))
+      .collect();
+    if (dishes.length === 0) return null;
+
+    type IngredientLine = {
+      ingredientId: Id<"ingredients">;
+      rawName: string;
+      canonicalName: string;
+      category: Doc<"ingredients">["category"];
+      estimatedQuantity: number;
+      unit: string;
+      confidence: Doc<"dishIngredients">["confidence"];
+      assumptionNote?: string;
+    };
+
+    const basketMap = new Map<
+      string,
+      {
+        ingredientId: Id<"ingredients">;
+        canonicalName: string;
+        category: Doc<"ingredients">["category"];
+        rows: { qty: number; unit: string }[];
+        confidence: Doc<"dishIngredients">["confidence"];
+        flag?: string;
+      }
+    >();
+
+    const dishesOut = await Promise.all(
+      dishes.map(async (dish) => {
+        const di = await ctx.db
+          .query("dishIngredients")
+          .withIndex("by_dishId", (q) => q.eq("dishId", dish._id))
+          .collect();
+        const ingredients: IngredientLine[] = [];
+        for (const row of di) {
+          const ing = await ctx.db.get(row.ingredientId);
+          if (!ing) continue;
+          ingredients.push({
+            ingredientId: row.ingredientId,
+            rawName: row.rawName,
+            canonicalName: ing.canonicalName,
+            category: ing.category,
+            estimatedQuantity: row.estimatedQuantity,
+            unit: row.unit,
+            confidence: row.confidence,
+            assumptionNote: row.assumptionNote,
+          });
+          const key = row.ingredientId as unknown as string;
+          const prev = basketMap.get(key);
+          const lowerConf = (a: typeof row.confidence, b: typeof row.confidence) =>
+            (a === "low" || b === "low") ? "low" : a === "medium" || b === "medium" ? "medium" : "high";
+          if (prev) {
+            prev.rows.push({ qty: row.estimatedQuantity, unit: row.unit });
+            prev.confidence = lowerConf(prev.confidence, row.confidence);
+            if (!prev.flag && row.assumptionNote) prev.flag = row.assumptionNote;
+          } else {
+            basketMap.set(key, {
+              ingredientId: row.ingredientId,
+              canonicalName: ing.canonicalName,
+              category: ing.category,
+              rows: [{ qty: row.estimatedQuantity, unit: row.unit }],
+              confidence: row.confidence,
+              flag: row.assumptionNote,
+            });
+          }
+        }
+        return { ...dish, ingredients };
+      }),
+    );
+
+    // Sum each basket entry's per-dish rows in a unit-aware way.
+    const basket = [...basketMap.values()].map((b) => {
+      const totaled = sumOccurrences(b.rows);
+      return {
+        ingredientId: b.ingredientId,
+        canonicalName: b.canonicalName,
+        category: b.category,
+        qty: totaled.qty,
+        unit: totaled.unit,
+        confidence: b.confidence,
+        flag: totaled.mixed
+          ? (b.flag ? `${b.flag} · mixed units` : "mixed units")
+          : b.flag,
+      };
+    });
+    const needReviewCount =
+      dishesOut.filter((d) => d.needsReview || d.confidence === "low").length;
+    const weeklyVolumeLb = basket.reduce(
+      (a, b) => a + (b.unit === "lb" ? b.qty : 0),
+      0,
+    );
+
+    return {
+      dishes: dishesOut,
+      basket,
+      stats: {
+        dishCount: dishesOut.length,
+        lineCount: basket.length,
+        weeklyVolumeLb: Math.round(weeklyVolumeLb),
+        needReviewCount,
+      },
+    };
   },
 });
 

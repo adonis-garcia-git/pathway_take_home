@@ -67,16 +67,20 @@ describe("aggregateIngredients — fuzzy", () => {
 });
 
 describe("aggregateIngredients — roll-up", () => {
-  it("picks dominant unit by summed quantity", () => {
+  it("normalizes mass units to the base unit (lb) when picking defaultUnit", () => {
+    // 3 oz (0.1875 lb) + 0.5 lb + 2 oz (0.125 lb) all share the mass dimension,
+    // so they should converge on the base unit rather than the most-frequent string.
     const result = aggregateIngredients([
-      // 3 oz vs 0.5 lb — oz wins by total (3 > 0.5 in summed-units terms because we don't convert)
       dish(0, [ing({ canonicalName: "tomato", unit: "oz", estimatedQuantity: 3, category: "produce" })]),
       dish(1, [ing({ canonicalName: "tomato", unit: "lb", estimatedQuantity: 0.5, category: "produce" })]),
       dish(2, [ing({ canonicalName: "tomato", unit: "oz", estimatedQuantity: 2, category: "produce" })]),
     ]);
     expect(result).toHaveLength(1);
-    expect(result[0].defaultUnit).toBe("oz");
+    expect(result[0].defaultUnit).toBe("lb");
     expect(result[0].occurrences).toHaveLength(3);
+    // Mixed-unit occurrences should NOT carry the "mixed units" note because
+    // they all live in the same (mass) dimension.
+    expect(result[0].occurrences.every((o) => !o.assumptionNote?.includes("mixed units"))).toBe(true);
   });
 
   it("category = mode across occurrences", () => {
@@ -97,6 +101,17 @@ describe("aggregateIngredients — roll-up", () => {
     expect(result).toHaveLength(1);
     expect(result[0].occurrences).toHaveLength(3);
     expect(result[0].occurrences.map((o) => o.dishIndex).sort()).toEqual([0, 1, 2]);
+  });
+
+  it("flags occurrences with 'mixed units' when dimensions cross (mass vs volume)", () => {
+    const result = aggregateIngredients([
+      dish(0, [ing({ canonicalName: "tomato", unit: "lb", estimatedQuantity: 1, category: "produce" })]),
+      dish(1, [ing({ canonicalName: "tomato", unit: "qt", estimatedQuantity: 1, category: "produce" })]),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(
+      result[0].occurrences.every((o) => o.assumptionNote?.includes("mixed units")),
+    ).toBe(true);
   });
 
   it("keeps distinct ingredients distinct", () => {

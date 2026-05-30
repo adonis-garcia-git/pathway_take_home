@@ -15,6 +15,7 @@
 
 import { token_set_ratio } from "fuzzball";
 import type { Category, Confidence, DishExtraction } from "./schemas";
+import { sumOccurrences } from "./units";
 
 export type ParsedDish = DishExtraction & { dishIndex: number };
 
@@ -155,19 +156,13 @@ function mode<T extends string>(values: T[]): T {
 }
 
 function dominantUnit(occurrences: IngredientOccurrence[]): string {
-  const totals = new Map<string, number>();
-  for (const o of occurrences) {
-    totals.set(o.unit, (totals.get(o.unit) ?? 0) + o.estimatedQuantity);
-  }
-  let best = occurrences[0].unit;
-  let bestQty = -Infinity;
-  for (const [u, q] of totals) {
-    if (q > bestQty) {
-      best = u;
-      bestQty = q;
-    }
-  }
-  return best;
+  // Convert each occurrence to its dimension's base unit (lb/each/gal) and
+  // pick the base unit of the most-massive dimension. Cross-dimension mixes
+  // are surfaced upstream via `assumptionNote: "mixed units"`.
+  const sum = sumOccurrences(
+    occurrences.map((o) => ({ qty: o.estimatedQuantity, unit: o.unit })),
+  );
+  return sum.unit;
 }
 
 // ── public API ──────────────────────────────────────────────────────
@@ -206,6 +201,11 @@ export function aggregateIngredients(dishes: ParsedDish[]): AggregatedIngredient
 
   const aggregated: AggregatedIngredient[] = [];
   for (const [canonicalName, members] of groups) {
+    // Detect mixed-dimension occurrences (e.g., "1 lb tomato" + "2 cup tomato")
+    // and tag every occurrence so downstream sees the ambiguity.
+    const mixedDims = sumOccurrences(
+      members.map((m) => ({ qty: m.estimatedQuantity, unit: m.unit })),
+    ).mixed;
     aggregated.push({
       canonicalName,
       category: mode(members.map((m) => m.category)),
@@ -216,7 +216,9 @@ export function aggregateIngredients(dishes: ParsedDish[]): AggregatedIngredient
         estimatedQuantity: m.estimatedQuantity,
         unit: m.unit,
         confidence: m.confidence,
-        assumptionNote: m.assumptionNote,
+        assumptionNote: mixedDims
+          ? (m.assumptionNote ? `${m.assumptionNote} · mixed units — confirm` : "mixed units — confirm")
+          : m.assumptionNote,
       })),
     });
   }

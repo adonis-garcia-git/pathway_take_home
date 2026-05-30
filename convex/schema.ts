@@ -37,7 +37,10 @@ export default defineSchema({
     lat: v.number(),
     lng: v.number(),
     sourceUrl: v.optional(v.string()),
-  }),
+    // Idempotency key for seed-style replays (e.g., "demo:frankies-457").
+    // Real user-created restaurants leave this undefined.
+    externalId: v.optional(v.string()),
+  }).index("by_externalId", ["externalId"]),
 
   menus: defineTable({
     restaurantId: v.id("restaurants"),
@@ -183,6 +186,13 @@ export default defineSchema({
     missingInfo: v.boolean(),
     rawEmailBody: v.string(),
     mailerooMessageId: v.string(),
+    // Idempotency marker for the missing-info follow-up. Cron only fires when
+    // missingInfo === true AND this is null.
+    missingInfoFollowUpSentAt: v.optional(v.number()),
+    // Optional extras the LLM extractor may populate; persisted for the
+    // comparison-table UI without forcing nullable everywhere else.
+    paymentTerms: v.optional(v.string()),
+    leadTime: v.optional(v.string()),
   })
     .index("by_rfpRecipientId", ["rfpRecipientId"])
     .index("by_distributorId", ["distributorId"])
@@ -205,4 +215,29 @@ export default defineSchema({
     ),
     createdAt: v.number(),
   }).index("by_restaurantId", ["restaurantId"]),
+
+  recommendations: defineTable({
+    runId: v.id("pipelineRuns"),
+    rfpId: v.id("rfps"),
+    primaryDistributorId: v.optional(v.id("distributors")),
+    splits: v.array(
+      v.object({
+        distributorId: v.id("distributors"),
+        role: v.string(),
+        weeklyValue: v.number(),
+      }),
+    ),
+    gaps: v.array(v.object({ item: v.string(), reason: v.string() })),
+    confidence,
+    needsHumanApproval: v.boolean(),
+    headline: v.string(),
+    rationale: v.string(),
+    estSavings: v.optional(v.number()),
+    estBaseline: v.optional(v.number()),
+    scoreSummary: v.any(),
+    approvedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_runId", ["runId"])
+    .index("by_rfpId", ["rfpId"]),
 });

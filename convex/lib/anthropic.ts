@@ -1,41 +1,30 @@
-// Claude menu extraction. We use tool use as the structured-output mechanism:
-// the model is forced to call `record_menu` whose input_schema is the JSON
-// Schema of MenuExtractionSchema. We safeParse the tool call; on Zod failure
-// we make exactly ONE retry with the issue messages fed back to the model.
+// Claude structured-output helpers. We use Anthropic tool_use as the
+// structured-output mechanism: force the model to call a tool whose
+// input_schema is a Zod schema converted via zod-to-json-schema. We safeParse
+// the tool call; on Zod failure we make ONE retry with the issue messages
+// fed back to the model.
+//
+// The same forcedToolCall helper is shared by:
+//   extractMenu (Phase 5)               — multimodal menu → MenuExtraction
+//   parseQuoteReply (Phase 6)            — distributor email → QuoteExtraction
+//   writeRecommendationRationale (Phase 6) — score draft → RecommendationRationale
 
 import Anthropic from "@anthropic-ai/sdk";
+import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { MenuExtractionSchema, type MenuExtraction } from "./schemas";
+import { withTimeout, withRetry } from "./net";
+import {
+  MenuExtractionSchema,
+  QuoteExtractionSchema,
+  RecommendationRationaleSchema,
+  type MenuExtraction,
+  type QuoteExtraction,
+  type RecommendationRationale,
+} from "./schemas";
 import { required } from "./env";
 
 const MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 8192;
-const TOOL_NAME = "record_menu";
-
-// Convert Zod → JSON Schema. The output type is `object` at the top level
-// (Anthropic's tool input_schema requires this).
-// jsonSchema7 + $refStrategy:"none" produces a flat draft-7-ish schema that
-// Anthropic accepts as tool input_schema. The default target ("jsonSchema7")
-// wraps in a $schema/$ref envelope which Anthropic rejects — we strip $schema
-// to keep the body draft-2020-12 compatible.
-const rawSchema = zodToJsonSchema(MenuExtractionSchema, {
-  target: "jsonSchema7",
-  $refStrategy: "none",
-}) as Record<string, unknown>;
-delete rawSchema.$schema;
-const TOOL_INPUT_SCHEMA = rawSchema;
-
-const SYSTEM_PROMPT = `You are an experienced restaurant chef helping a procurement agent decompose menus into ingredient baskets.
-
-For every dish on the menu, list every distinct ingredient needed for a SINGLE SERVING (one plate). Menus never list quantities — use your chef judgement to estimate. State your key assumption when confidence is medium or low.
-
-Be conservative with confidence. Vague dish names, house specials with no description, or ambiguous cuts should be flagged with confidence:"low" + needsReview:true. Procurement decisions cascade off these flags.
-
-canonicalName must be SINGULAR, lowercased, and brand/cultivar/grade stripped so we can dedup across dishes. Examples: "San Marzano tomatoes" → "tomato"; "fresh mozzarella di bufala" → "mozzarella cheese"; "EVOO" → "olive oil"; "ground beef (80/20)" → "ground beef".
-
-Skip section headers ("Antipasti"), prices, allergen notes, and footers.
-
-Always call the record_menu tool to return results — never reply with prose.`;
 
 type ContentBlock =
   | { type: "text"; text: string }
@@ -58,42 +47,87 @@ function findToolUse(content: Anthropic.Messages.ContentBlock[]): ToolUseBlock |
   return null;
 }
 
+// jsonSchema7 + $refStrategy:"none" + strip $schema → flat draft-7-ish object
+// that Anthropic accepts as tool input_schema.
+function toolSchemaFor<S extends z.ZodTypeAny>(schema: S): Record<string, unknown> {
+  const raw = zodToJsonSchema(schema, {
+    target: "jsonSchema7",
+    $refStrategy: "none",
+  }) as Record<string, unknown>;
+  delete raw.$schema;
+  return raw;
+}
+
+interface ForcedToolCallOptions<S extends z.ZodTypeAny> {
+  toolName: string;
+  toolDescription: string;
+  systemPrompt: string;
+  outputSchema: S;
+  content: MenuContent;
+}
+
 /**
- * Extract a menu using Claude. Forces tool_use of record_menu. On Zod failure,
- * makes ONE retry with the issue messages fed back. Throws on second failure.
+ * Run a forced-tool-use Claude call with Zod validation + one retry on
+ * Zod failure (issues fed back to the model via tool_result with is_error).
  */
-export async function extractMenu(content: MenuContent): Promise<MenuExtraction> {
+async function forcedToolCall<S extends z.ZodTypeAny>(
+  opts: ForcedToolCallOptions<S>,
+): Promise<z.infer<S>> {
   const apiKey = required("ANTHROPIC_API_KEY");
   const client = new Anthropic({ apiKey });
 
   const tool: Anthropic.Messages.Tool = {
-    name: TOOL_NAME,
-    description:
-      "Record the structured menu extraction. Must include every dish (skip section headers) with per-serving ingredient estimates.",
-    input_schema: TOOL_INPUT_SCHEMA as Anthropic.Messages.Tool["input_schema"],
+    name: opts.toolName,
+    description: opts.toolDescription,
+    input_schema: toolSchemaFor(opts.outputSchema) as Anthropic.Messages.Tool["input_schema"],
   };
 
   const baseMessages: Anthropic.Messages.MessageParam[] = [
-    // The SDK's union type for message content includes our text/image/document
-    // shapes; cast through unknown to avoid SDK-version churn on the param name.
-    { role: "user", content: content as unknown as Anthropic.Messages.MessageParam["content"] },
+    {
+      role: "user",
+      content: opts.content as unknown as Anthropic.Messages.MessageParam["content"],
+    },
   ];
 
+  // 30s deadline (Claude can be slow on PDFs); 1 retry on overload (529)
+  // or transient network errors. 4xx (bad key, bad prompt) is permanent.
+  const callClaude = (messages: Anthropic.Messages.MessageParam[]) =>
+    withRetry(
+      () =>
+        withTimeout(
+          client.messages.create({
+            model: MODEL,
+            max_tokens: MAX_TOKENS,
+            system: opts.systemPrompt,
+            tools: [tool],
+            tool_choice: { type: "tool", name: opts.toolName },
+            messages,
+          }),
+          30_000,
+          "anthropic.messages.create",
+        ),
+      {
+        attempts: 2,
+        baseMs: 500,
+        label: "anthropic.messages.create",
+        retryOn: (err) => {
+          if (err instanceof Error && err.name === "TimeoutError") return true;
+          // Anthropic SDK throws APIError with .status; 529 = overload, 5xx = transient
+          const status = (err as { status?: number })?.status;
+          if (typeof status === "number") return status === 529 || status >= 500;
+          return false;
+        },
+      },
+    );
+
   // ── attempt 1 ─────────────────────────────────────────────────
-  const first = await client.messages.create({
-    model: MODEL,
-    max_tokens: MAX_TOKENS,
-    system: SYSTEM_PROMPT,
-    tools: [tool],
-    tool_choice: { type: "tool", name: TOOL_NAME },
-    messages: baseMessages,
-  });
+  const first = await callClaude(baseMessages);
 
   const firstToolUse = findToolUse(first.content);
   if (!firstToolUse) {
-    throw new Error("Claude did not call record_menu on first attempt.");
+    throw new Error(`Claude did not call ${opts.toolName} on first attempt.`);
   }
-  const firstParse = MenuExtractionSchema.safeParse(firstToolUse.input);
+  const firstParse = opts.outputSchema.safeParse(firstToolUse.input);
   if (firstParse.success) return firstParse.data;
 
   // ── attempt 2 (retry once with issue messages) ────────────────
@@ -122,26 +156,19 @@ export async function extractMenu(content: MenuContent): Promise<MenuExtraction>
           type: "tool_result",
           tool_use_id: firstToolUse.id,
           is_error: true,
-          content: `The tool call failed validation. Fix these issues and call record_menu again:\n${issues}`,
+          content: `The tool call failed validation. Fix these issues and call ${opts.toolName} again:\n${issues}`,
         },
       ],
     },
   ];
 
-  const second = await client.messages.create({
-    model: MODEL,
-    max_tokens: MAX_TOKENS,
-    system: SYSTEM_PROMPT,
-    tools: [tool],
-    tool_choice: { type: "tool", name: TOOL_NAME },
-    messages: retryMessages,
-  });
+  const second = await callClaude(retryMessages);
 
   const secondToolUse = findToolUse(second.content);
   if (!secondToolUse) {
-    throw new Error("Claude did not call record_menu on retry.");
+    throw new Error(`Claude did not call ${opts.toolName} on retry.`);
   }
-  const secondParse = MenuExtractionSchema.safeParse(secondToolUse.input);
+  const secondParse = opts.outputSchema.safeParse(secondToolUse.input);
   if (!secondParse.success) {
     const summary = secondParse.error.issues
       .slice(0, 5)
@@ -150,4 +177,121 @@ export async function extractMenu(content: MenuContent): Promise<MenuExtraction>
     throw new Error(`Claude tool output failed validation after retry: ${summary}`);
   }
   return secondParse.data;
+}
+
+// ── extractMenu (Phase 5) ────────────────────────────────────────
+
+const MENU_SYSTEM = `You are an experienced restaurant chef helping a procurement agent decompose menus into ingredient baskets.
+
+For every dish on the menu, list every distinct ingredient needed for a SINGLE SERVING (one plate). Menus never list quantities — use your chef judgement to estimate. State your key assumption when confidence is medium or low.
+
+Be conservative with confidence. Vague dish names, house specials with no description, or ambiguous cuts should be flagged with confidence:"low" + needsReview:true. Procurement decisions cascade off these flags.
+
+canonicalName must be SINGULAR, lowercased, and brand/cultivar/grade stripped so we can dedup across dishes. Examples: "San Marzano tomatoes" → "tomato"; "fresh mozzarella di bufala" → "mozzarella cheese"; "EVOO" → "olive oil"; "ground beef (80/20)" → "ground beef".
+
+Skip section headers ("Antipasti"), prices, allergen notes, and footers.
+
+Always call the record_menu tool to return results — never reply with prose.`;
+
+export async function extractMenu(content: MenuContent): Promise<MenuExtraction> {
+  return forcedToolCall({
+    toolName: "record_menu",
+    toolDescription:
+      "Record the structured menu extraction. Must include every dish (skip section headers) with per-serving ingredient estimates.",
+    systemPrompt: MENU_SYSTEM,
+    outputSchema: MenuExtractionSchema,
+    content,
+  });
+}
+
+// ── parseQuoteReply (Phase 6) ────────────────────────────────────
+
+const QUOTE_SYSTEM = `You are a procurement analyst extracting a structured quote from a distributor's free-text email reply to our RFP.
+
+We will give you (1) the basket we asked them to quote — a list of {canonicalName, quantity, unit} — and (2) the distributor's reply text (already stripped of quoted history).
+
+For every basket line the distributor responded to, emit a QuoteLine. For lines they explicitly said they don't carry / are out of stock: set available:false and price:null. If they quoted a price without saying anything about availability: assume available:true.
+
+canonicalName MUST match our basket's canonical names whenever you're confident (e.g. their "San Marzano DOP" → our "tomato"). When unsure, use your best singular common-noun guess; the caller will reconcile.
+
+Set missingInfo:true if ANY basket line is absent from the reply OR a quoted line lacks a price. This flags an autonomous follow-up.
+
+Extract deliveryTerms / paymentTerms / leadTime verbatim when stated. totalPrice only if the distributor stated a basket total themselves; do NOT compute it.
+
+Be conservative with parseConfidence: "low" if the reply is short/ambiguous, "high" only when every basket line was addressed with a clear price+unit.
+
+Always call the record_quote tool — never reply with prose.`;
+
+export async function parseQuoteReply(
+  rawEmailBody: string,
+  basket: { canonicalName: string; quantity: number; unit: string }[],
+  distributorName: string,
+): Promise<QuoteExtraction> {
+  const basketBlock = basket
+    .map((b) => `- ${b.canonicalName} (${b.quantity} ${b.unit})`)
+    .join("\n");
+
+  const content: MenuContent = [
+    {
+      type: "text",
+      text: `BASKET (what we asked for):\n${basketBlock}\n\nDISTRIBUTOR: ${distributorName}\n\nREPLY (stripped of quoted history):\n${rawEmailBody}`,
+    },
+  ];
+
+  return forcedToolCall({
+    toolName: "record_quote",
+    toolDescription:
+      "Record the structured quote extraction from the distributor's reply. Cover every basket line they addressed; flag missing info.",
+    systemPrompt: QUOTE_SYSTEM,
+    outputSchema: QuoteExtractionSchema,
+    content,
+  });
+}
+
+// ── writeRecommendationRationale (Phase 6) ──────────────────────
+
+const RATIONALE_SYSTEM = `You are a procurement analyst writing a brief, candid award rationale for a restaurant client.
+
+You will be given a recommendation draft: the top distributor (or null), any complementary splits, gaps, estimated savings vs USDA baseline, and approval flags. Write a one-sentence headline (≤ 90 chars) and a 2–3 sentence rationale grounded in price, basket coverage, and payment/delivery terms.
+
+If needsHumanApproval is true, name the specific reason in the rationale (thin margin, low completeness, missing info, no viable quote).
+
+Always call the record_rationale tool — never reply with prose.`;
+
+interface RationaleInput {
+  primary?: {
+    distributorName: string;
+    totalPrice: number | null;
+    completenessScore: number;
+    paymentTerms?: string;
+    deliveryTerms?: string;
+  } | null;
+  splits: { distributorName: string; role: string; weeklyValue: number }[];
+  gaps: { item: string; reason: string }[];
+  margin: number;
+  confidence: "high" | "medium" | "low";
+  needsHumanApproval: boolean;
+  estSavings: number;
+  estBaseline: number;
+}
+
+export async function writeRecommendationRationale(
+  input: RationaleInput,
+): Promise<RecommendationRationale> {
+  const summary = JSON.stringify(input, null, 2);
+  const content: MenuContent = [
+    {
+      type: "text",
+      text: `RECOMMENDATION DRAFT:\n${summary}`,
+    },
+  ];
+
+  return forcedToolCall({
+    toolName: "record_rationale",
+    toolDescription:
+      "Write the human-readable headline and rationale for this recommendation draft.",
+    systemPrompt: RATIONALE_SYSTEM,
+    outputSchema: RecommendationRationaleSchema,
+    content,
+  });
 }

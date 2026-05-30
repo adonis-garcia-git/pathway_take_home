@@ -13,6 +13,7 @@
 
 import { z } from "zod";
 import type { ReportSlug } from "./fuzzy";
+import { fetchWithTimeout, withRetry, HttpError } from "./net";
 
 const MARS_BASE = "https://marsapi.ams.usda.gov/services/v1.2";
 
@@ -168,17 +169,32 @@ function unwrapEnvelope<T>(parsed: T[] | { results: T[] }): T[] {
 // ── HTTP helpers ───────────────────────────────────────────────────────────
 
 async function getJson(url: string, apiKey: string): Promise<unknown> {
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: basicAuthHeader(apiKey),
-      Accept: "application/json",
+  return withRetry(
+    async () => {
+      const res = await fetchWithTimeout(url, {
+        method: "GET",
+        timeoutMs: 10_000,
+        label: "usda.mars",
+        headers: {
+          Authorization: basicAuthHeader(apiKey),
+          Accept: "application/json",
+        },
+      });
+      if (!res.ok) {
+        throw new HttpError("usda.mars", res.status, await safeBody(res));
+      }
+      return res.json();
     },
-  });
-  if (!res.ok) {
-    throw new Error(`USDA MARS ${res.status} ${res.statusText} for ${url}`);
+    { attempts: 2, baseMs: 300, label: "usda.mars" },
+  );
+}
+
+async function safeBody(res: Response): Promise<string | undefined> {
+  try {
+    return (await res.clone().text()).slice(0, 200);
+  } catch {
+    return undefined;
   }
-  return res.json();
 }
 
 // ── Public client ──────────────────────────────────────────────────────────

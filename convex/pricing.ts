@@ -11,7 +11,7 @@
 // The stage wrapper in pipeline/fetchPricing.ts just calls the action.
 
 import { v } from "convex/values";
-import { internalAction, internalMutation, internalQuery } from "./_generated/server";
+import { internalAction, internalMutation, internalQuery, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
@@ -328,3 +328,140 @@ export const fetchAllPricesAction = internalAction({
 
 // Convenience type re-export used by the stage wrapper.
 export type { Id };
+
+// ── Public reactive query: feeds PricingPanel ───────────────────────────────
+
+type Provenance = "usda" | "estimated" | "mock" | "no_data";
+type PriceProv = Doc<"ingredientPrices">["source"];
+
+function provenanceFromSource(src: PriceProv): Provenance {
+  if (src === "usda_mars" || src === "usda_nass") return "usda";
+  if (src === "estimated") return "estimated";
+  return "mock";
+}
+
+function sourceLabel(row: Doc<"ingredientPrices">): string {
+  if (row.source === "usda_mars") return `USDA MARS · ${row.region ?? "national"}`;
+  if (row.source === "usda_nass") return `USDA NASS · ${row.region ?? "national"}`;
+  if (row.source === "estimated") return "Estimated (category avg)";
+  return "Mock (category avg)";
+}
+
+export const getPricingForRun = query({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const run = await ctx.db.get(runId);
+    if (!run) return null;
+
+    // Source of basket: prefer rfp.ingredientList (snapshot from send-time);
+    // otherwise derive from dishIngredients across the menu's dishes.
+    type BasketItem = {
+      ingredientId: Id<"ingredients">;
+      qty: number;
+      unit: string;
+    };
+    let basket: BasketItem[] = [];
+
+    if (run.rfpId) {
+      const rfp = await ctx.db.get(run.rfpId);
+      if (rfp) {
+        basket = rfp.ingredientList.map((l) => ({
+          ingredientId: l.ingredientId,
+          qty: l.quantity,
+          unit: l.unit,
+        }));
+      }
+    }
+    if (basket.length === 0 && run.menuId) {
+      const menuId = run.menuId;
+      const dishes = await ctx.db
+        .query("dishes")
+        .withIndex("by_menuId", (q) => q.eq("menuId", menuId))
+        .collect();
+      const agg = new Map<string, BasketItem>();
+      for (const dish of dishes) {
+        const dis = await ctx.db
+          .query("dishIngredients")
+          .withIndex("by_dishId", (q) => q.eq("dishId", dish._id))
+          .collect();
+        for (const r of dis) {
+          const k = r.ingredientId as unknown as string;
+          const prev = agg.get(k);
+          if (prev) prev.qty = Math.round((prev.qty + r.estimatedQuantity) * 10) / 10;
+          else agg.set(k, { ingredientId: r.ingredientId, qty: r.estimatedQuantity, unit: r.unit });
+        }
+      }
+      basket = [...agg.values()];
+    }
+
+    if (basket.length === 0) return null;
+
+    type Row = {
+      id: Id<"ingredients">;
+      name: string;
+      category: Doc<"ingredients">["category"];
+      qty: number;
+      unit: string;
+      price: number | null;
+      trend: number | null;
+      provenance: Provenance;
+      sourceLabel: string;
+      flag?: string;
+    };
+
+    let latestReportDate = "";
+    const rows: Row[] = [];
+    for (const b of basket) {
+      const ing = await ctx.db.get(b.ingredientId);
+      if (!ing) continue;
+      // newest price row for this ingredient
+      const prices = await ctx.db
+        .query("ingredientPrices")
+        .withIndex("by_ingredient_and_reportDate", (q) => q.eq("ingredientId", b.ingredientId))
+        .order("desc")
+        .take(1);
+      const p = prices[0];
+
+      if (!p) {
+        rows.push({
+          id: b.ingredientId,
+          name: ing.canonicalName,
+          category: ing.category,
+          qty: b.qty,
+          unit: b.unit,
+          price: null,
+          trend: null,
+          provenance: "no_data",
+          sourceLabel: "No public series",
+        });
+        continue;
+      }
+
+      if (p.reportDate > latestReportDate) latestReportDate = p.reportDate;
+
+      rows.push({
+        id: b.ingredientId,
+        name: ing.canonicalName,
+        category: ing.category,
+        qty: b.qty,
+        unit: b.unit,
+        price: p.price ?? null,
+        trend: p.trend ?? null,
+        provenance: provenanceFromSource(p.source),
+        sourceLabel: sourceLabel(p),
+        flag: p.unmatched ? "weak match" : undefined,
+      });
+    }
+
+    const priced = rows.filter((r) => r.provenance === "usda" && r.price != null).length;
+    const estimated = rows.filter((r) => r.provenance === "estimated" || r.provenance === "mock").length;
+    const noData = rows.filter((r) => r.provenance === "no_data").length;
+    const weeklyTotal = rows.reduce((a, r) => (r.price ? a + r.price * r.qty : a), 0);
+
+    return {
+      asOf: latestReportDate || new Date().toISOString().slice(0, 10),
+      rows,
+      summary: { priced, estimated, noData, weeklyTotal: Math.round(weeklyTotal) },
+    };
+  },
+});

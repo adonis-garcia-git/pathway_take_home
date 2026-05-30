@@ -8,6 +8,7 @@
 // crosses the trust boundary with Zod.
 
 import { z } from "zod";
+import { fetchWithTimeout, withRetry, HttpError, TimeoutError } from "./net";
 
 const SEND_ENDPOINT = "https://smtp.maileroo.com/api/v2/emails";
 
@@ -66,15 +67,35 @@ export async function sendBasicEmail(input: SendBasicEmailInput): Promise<SendBa
 
   let res: Response;
   try {
-    res = await fetch(SEND_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": input.apiKey,
-      },
-      body: JSON.stringify(body),
-    });
+    // Retry transient failures (timeout / 5xx / 429) but NOT 4xx — Maileroo's
+    // 4xx are typically "bad recipient" which is terminal; retrying just wastes budget.
+    res = await withRetry(
+      () =>
+        fetchWithTimeout(SEND_ENDPOINT, {
+          method: "POST",
+          timeoutMs: 8_000,
+          label: "maileroo.send",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Api-Key": input.apiKey,
+          },
+          body: JSON.stringify(body),
+        }).then(async (r) => {
+          if (r.status >= 500 || r.status === 429) {
+            // Throw to trigger the retry policy; preserve body for diagnostics.
+            throw new HttpError("maileroo.send", r.status, await r.clone().text());
+          }
+          return r;
+        }),
+      { attempts: 2, baseMs: 400, label: "maileroo.send" },
+    );
   } catch (e) {
+    if (e instanceof HttpError) {
+      return { ok: false, status: e.status, error: e.message };
+    }
+    if (e instanceof TimeoutError) {
+      return { ok: false, status: 0, error: e.message };
+    }
     return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) };
   }
 
@@ -136,9 +157,15 @@ export type MailerooInbound = z.infer<typeof mailerooInboundSchema>;
 // webhook. The docs accept either GET or POST; we try GET first then POST.
 // Expected success shape: { success: true }.
 export async function verifyMailerooInbound(validationUrl: string): Promise<boolean> {
+  // 5s per method, no retry — Maileroo redelivers on a non-2xx response,
+  // so retrying here just delays the redelivery loop.
   const tryMethod = async (method: "GET" | "POST"): Promise<boolean> => {
     try {
-      const res = await fetch(validationUrl, { method });
+      const res = await fetchWithTimeout(validationUrl, {
+        method,
+        timeoutMs: 5_000,
+        label: `maileroo.verify(${method})`,
+      });
       if (!res.ok) return false;
       const json = (await res.json()) as { success?: boolean };
       return json?.success === true;

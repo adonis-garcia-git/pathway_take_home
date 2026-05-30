@@ -8,7 +8,11 @@ const geist = Geist({ subsets: ["latin"], weight: ["300", "400", "500", "600", "
 const geistMono = Geist_Mono({ subsets: ["latin"], weight: ["400", "500", "600"], variable: "--font-geist-mono" });
 const newsreader = Newsreader({ subsets: ["latin"], weight: ["300", "400", "500", "600"], style: ["normal", "italic"], variable: "--font-newsreader" });
 
-export const metadata: Metadata = { title: "Pathway · RFP Pipeline", description: "World-class procurement that runs itself." };
+export const metadata: Metadata = {
+  title: "Pathway · RFP Pipeline",
+  description: "World-class procurement that runs itself.",
+  icons: { icon: "/patty.svg" },
+};
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (

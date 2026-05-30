@@ -8,11 +8,13 @@
 
 import { z } from "zod";
 import { optional } from "./env";
+import { fetchWithTimeout, withRetry, HttpError } from "./net";
 
 const PLACES_ENDPOINT = "https://places.googleapis.com/v1/places:searchText";
 const FIELD_MASK =
   "places.displayName,places.formattedAddress,places.websiteUri,places.location,places.nationalPhoneNumber,places.id";
-const SEARCH_RADIUS_METERS = 8000;
+export const DEFAULT_SEARCH_RADIUS_METERS = 8_000;
+export const WIDE_SEARCH_RADIUS_METERS = 25_000;
 
 const placeSchema = z.object({
   id: z.string(),
@@ -52,6 +54,7 @@ export type LatLng = { lat: number; lng: number };
 export const placesTextSearch = async (
   textQuery: string,
   center: LatLng,
+  options: { radiusMeters?: number } = {},
 ): Promise<PlacesResult[]> => {
   const apiKey = optional("GOOGLE_PLACES_API_KEY");
   if (!apiKey) {
@@ -62,32 +65,39 @@ export const placesTextSearch = async (
     return [];
   }
 
+  const radius = options.radiusMeters ?? DEFAULT_SEARCH_RADIUS_METERS;
   const body = {
     textQuery,
     locationBias: {
       circle: {
         center: { latitude: center.lat, longitude: center.lng },
-        radius: SEARCH_RADIUS_METERS,
+        radius,
       },
     },
   };
 
-  const res = await fetch(PLACES_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Api-Key": apiKey,
-      "X-Goog-FieldMask": FIELD_MASK,
+  const json: unknown = await withRetry(
+    async () => {
+      const res = await fetchWithTimeout(PLACES_ENDPOINT, {
+        method: "POST",
+        timeoutMs: 10_000,
+        label: "places.textSearch",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask": FIELD_MASK,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const text = await res.clone().text();
+        throw new HttpError("places.textSearch", res.status, text);
+      }
+      return res.json();
     },
-    body: JSON.stringify(body),
-  });
+    { attempts: 2, baseMs: 400, label: "places.textSearch" },
+  );
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Places searchText ${res.status}: ${text.slice(0, 200)}`);
-  }
-
-  const json: unknown = await res.json();
   const parsed = responseSchema.parse(json);
   const places = parsed.places ?? [];
 
