@@ -10,7 +10,7 @@ Built with **Next.js 15 (App Router) + TypeScript + Tailwind v4 + Convex + Claud
 pnpm install
 cp .env.example .env.local
 
-# Convex (interactive — pick "create new project")
+# Convex (interactive: pick "create new project")
 npx convex dev
 
 # In another terminal:
@@ -31,9 +31,9 @@ npx convex env set GOOGLE_PLACES_API_KEY <key>
 
 ## Docs
 
-- **[CLAUDE.md](./CLAUDE.md)** — project doctrine: architecture, Convex patterns, coding conventions, glossary, definition-of-done.
-- **[.env.example](./.env.example)** — every env var, where to get it, where it lives.
-- **[design-reference/](./design-reference/)** — read-only design package: tokens, component spec, state vocabulary, seed data.
+- **[CLAUDE.md](./CLAUDE.md)**: project doctrine: architecture, Convex patterns, coding conventions, glossary, definition-of-done.
+- **[.env.example](./.env.example)**: every env var, where to get it, where it lives.
+- **[design-reference/](./design-reference/)**: read-only design package: tokens, component spec, state vocabulary, seed data.
 
 ## Scripts
 

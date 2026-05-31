@@ -3,6 +3,9 @@ import {
   bestMatch,
   similarity,
   splitHeadAndModifier,
+  weakMatches,
+  WEAK_MATCH_LOWER,
+  CONFIDENCE_THRESHOLD,
   PRIMARY_REPORT_BY_CATEGORY,
   SECONDARY_REPORT_BY_CATEGORY,
   CATEGORY_AVG_PRICE,
@@ -66,6 +69,42 @@ describe("similarity / splitHeadAndModifier", () => {
     const r = splitHeadAndModifier("tomato");
     expect(r.head).toBe("tomato");
     expect(r.modifier).toBe("");
+  });
+});
+
+describe("weakMatches", () => {
+  it("returns only candidates inside [WEAK_MATCH_LOWER, CONFIDENCE_THRESHOLD)", () => {
+    const candidates: Candidate[] = [
+      { commodity: "tomato" }, // strong match → excluded (>= threshold)
+      { commodity: "potato" }, // similar to "tomato" → likely weak
+      { commodity: "chair" }, // nothing → likely below WEAK_MATCH_LOWER
+    ];
+    const out = weakMatches("tomato", candidates);
+    for (const w of out) {
+      expect(w.confidence).toBeGreaterThanOrEqual(WEAK_MATCH_LOWER);
+      expect(w.confidence).toBeLessThan(CONFIDENCE_THRESHOLD);
+    }
+    // The strong hit on "tomato" must not appear in the weak set.
+    expect(out.some((w) => w.candidate.commodity === "tomato")).toBe(false);
+  });
+
+  it("sorts results by confidence descending", () => {
+    const candidates: Candidate[] = [
+      { commodity: "tomatillo" },
+      { commodity: "potato" },
+      { commodity: "tomato" }, // excluded
+    ];
+    const out = weakMatches("tomato", candidates);
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i].confidence).toBeLessThanOrEqual(out[i - 1].confidence);
+    }
+  });
+
+  it("returns empty when no candidate falls in the window", () => {
+    const r1 = weakMatches("tomato", [{ commodity: "tomato" }]);
+    expect(r1).toEqual([]);
+    const r2 = weakMatches("tomato", [{ commodity: "absolutely nothing" }]);
+    expect(r2).toEqual([]);
   });
 });
 

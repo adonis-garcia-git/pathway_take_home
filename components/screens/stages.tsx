@@ -14,6 +14,7 @@ import {
   EmptyState, ReviewStrip, Patty, Button, TableHead, TableRow,
 } from "@/components/ui";
 import type { Category as UICategory, Provenance as UIProvenance } from "@/lib/data";
+import { bboxToStaticMapParams, projectMercator, projectBbox } from "@/lib/map";
 import { ApproveModal } from "@/components/screens/modals";
 
 type Phase = "pending" | "running" | "done" | "error";
@@ -111,7 +112,7 @@ export function RecipesPanel({
             {d.needsReview && (
               <div className="flex gap-[7px] items-start mt-[11px] pt-[11px] border-t border-dashed border-border-strong text-[12.5px] text-muted leading-snug">
                 <Flag size={13} className="text-st-warn shrink-0 mt-px" />
-                Needs review — quantities estimated from a short menu description.
+                Needs review. Quantities estimated from a short menu description.
               </div>
             )}
           </Card>
@@ -119,7 +120,7 @@ export function RecipesPanel({
       </div>
       {lowConf.length > 0 && (
         <ReviewStrip Icon={Flag}>
-          <b className="text-ink font-medium">{lowConf.length} items flagged for review.</b> Quantities for low-confidence dishes are estimated — confirm before ordering.
+          <b className="text-ink font-medium">{lowConf.length} items flagged for review.</b> Quantities for low-confidence dishes are estimated. Confirm before ordering.
         </ReviewStrip>
       )}
     </div>
@@ -136,6 +137,36 @@ const Stat = ({ n, label, warn }: { n: React.ReactNode; label: string; warn?: bo
 );
 
 /* ═══════════ 2 · PRICING ═══════════ */
+
+type PricingRow = {
+  price: number | null;
+  sourceLabel: string;
+  provenance: "usda" | "estimated" | "mock" | "no_data";
+  estimationDetail?: {
+    method: "neighbors" | "category";
+    category?: string;
+    contributingReports?: { commodity: string; price: number; confidence: number; region?: string }[];
+  };
+};
+
+function estimationTooltip(r: PricingRow): string | undefined {
+  if (r.provenance === "usda") return r.sourceLabel;
+  if (r.provenance === "no_data") return "No public USDA series for this commodity. Patty will ask distributors to quote it directly.";
+  const d = r.estimationDetail;
+  if (d?.method === "neighbors" && d.contributingReports && d.contributingReports.length > 0) {
+    const cites = d.contributingReports
+      .slice(0, 4)
+      .map((c) => `${c.commodity} $${c.price.toFixed(2)}`)
+      .join(", ");
+    return `Median of ${d.contributingReports.length} weak USDA matches: ${cites}.`;
+  }
+  if (d?.method === "category") {
+    const cat = d.category ?? "category";
+    return `Category average for ${cat}. No close USDA matches found, so we used a documented per-pound estimate.`;
+  }
+  return r.sourceLabel;
+}
+
 export function PricingPanel({
   phase,
   runId,
@@ -210,12 +241,15 @@ export function PricingPanel({
               </span>
               <span className="font-mono text-muted text-[12.5px]">{r.qty} {r.unit}</span>
               <span className="font-mono font-medium text-ink">
-                {nd ? <span className="text-faint">—</span> : (
+                {nd ? <span className="text-faint">–</span> : (
                   <>${r.price!.toFixed(2)}<span className="text-faint text-[11.5px] font-normal">/{r.unit}</span></>
                 )}
               </span>
               <span><Trend pct={r.trend} /></span>
-              <span className="flex flex-col gap-[3px] items-start">
+              <span
+                className="flex flex-col gap-[3px] items-start"
+                title={estimationTooltip(r)}
+              >
                 <ProvenanceBadge prov={r.provenance as UIProvenance} size="sm" />
                 <span className="text-[11px] text-faint">{r.sourceLabel}</span>
               </span>
@@ -227,7 +261,7 @@ export function PricingPanel({
         <ReviewStrip Icon={Minus}>
           <b className="text-ink font-medium">{noDataRows.length} items have no public pricing.</b>{" "}
           {noDataRows.slice(0, 2).map((r) => r.name).join(" and ")}
-          {noDataRows.length > 2 ? `, plus ${noDataRows.length - 2} more` : ""} — Patty will ask distributors to quote these directly rather than guess.
+          {noDataRows.length > 2 ? `, plus ${noDataRows.length - 2} more` : ""}. Patty will ask distributors to quote these directly rather than guess.
         </ReviewStrip>
       )}
     </div>
@@ -270,6 +304,7 @@ function DistributorsBody({
   phase: Phase;
 }) {
   const data = useQuery(api.distributors.getDistributorsForRun, { runId });
+  const [mapFailed, setMapFailed] = useState(false);
 
   if (phase === "running" || !data)
     return (
@@ -292,25 +327,31 @@ function DistributorsBody({
       </div>
     );
 
-  // Project distributor lat/lng into a stylized 0–100 viewport using bbox + padding.
-  const lats = data.map((d) => d.lat).filter((v) => v !== 0);
-  const lngs = data.map((d) => d.lng).filter((v) => v !== 0);
-  const minLat = lats.length ? Math.min(...lats) : 0;
-  const maxLat = lats.length ? Math.max(...lats) : 1;
-  const minLng = lngs.length ? Math.min(...lngs) : 0;
-  const maxLng = lngs.length ? Math.max(...lngs) : 1;
-  const project = (lat: number, lng: number) => {
-    if (maxLat === minLat || maxLng === minLng) return { x: 50, y: 50 };
-    const x = 10 + ((lng - minLng) / (maxLng - minLng)) * 80;
-    // Latitude axis: north is up, so invert.
-    const y = 10 + (1 - (lat - minLat) / (maxLat - minLat)) * 80;
-    return { x, y };
-  };
+  const distributors = data.distributors;
+  const restaurant = data.restaurant;
+
+  // Frame the static map so restaurant + every distributor fits.
+  const allLats = [restaurant.lat, ...distributors.map((d) => d.lat)];
+  const allLngs = [restaurant.lng, ...distributors.map((d) => d.lng)];
+  const { center, zoom } = bboxToStaticMapParams(allLats, allLngs);
+  const MAP_W = 600;
+  const MAP_H = 750;
+  const markers = [
+    `${restaurant.lat},${restaurant.lng}`,
+    ...distributors.map((d) => `${d.lat},${d.lng}`),
+  ].join("|");
+  const mapSrc = `/api/static-map?center=${center.lat},${center.lng}&zoom=${zoom}&size=${MAP_W}x${MAP_H}&markers=${encodeURIComponent(markers)}`;
+  // Real Google map → Mercator projection. Stylized fallback → bbox 10-90.
+  const project = (lat: number, lng: number) =>
+    mapFailed
+      ? projectBbox(lat, lng, allLats, allLngs)
+      : projectMercator(lat, lng, center.lat, center.lng, zoom, MAP_W, MAP_H);
+  const restaurantPin = project(restaurant.lat, restaurant.lng);
 
   return (
     <div className="grid grid-cols-2 gap-4 items-start animate-rise">
       <div className="flex flex-col gap-3 max-h-[640px] overflow-y-auto pr-1">
-        {data.map((d) => (
+        {distributors.map((d) => (
           <Card pad key={d._id} className="animate-rise">
             <div className="flex items-start justify-between">
               <div className="flex items-start gap-2.5">
@@ -348,19 +389,37 @@ function DistributorsBody({
           </Card>
         ))}
       </div>
-      {/* stylized map */}
+      {/* Real Google static map with our pin overlay. If the proxy returns
+          non-2xx (key missing, API not enabled, upstream error), the img
+          onError swaps in a stylized gradient + grid placeholder so the
+          card never renders broken. */}
       <Card
         className="relative aspect-[4/5] min-h-[360px] overflow-hidden sticky top-[76px]"
-        style={{ background: "linear-gradient(160deg,#F3F1EA,#ECEFE9)" } as React.CSSProperties}
+        style={
+          mapFailed
+            ? ({ background: "linear-gradient(160deg,#F3F1EA,#ECEFE9)" } as React.CSSProperties)
+            : undefined
+        }
       >
-        <div
-          className="absolute inset-0 opacity-50"
-          style={{
-            backgroundImage:
-              "linear-gradient(#E9E5DA 1px,transparent 1px),linear-gradient(90deg,#E9E5DA 1px,transparent 1px)",
-            backgroundSize: "34px 34px",
-          }}
-        />
+        {mapFailed ? (
+          <div
+            className="absolute inset-0 opacity-50"
+            style={{
+              backgroundImage:
+                "linear-gradient(#E9E5DA 1px,transparent 1px),linear-gradient(90deg,#E9E5DA 1px,transparent 1px)",
+              backgroundSize: "34px 34px",
+            }}
+          />
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={mapSrc}
+            alt=""
+            aria-hidden
+            onError={() => setMapFailed(true)}
+            className="absolute inset-0 w-full h-full object-cover"
+          />
+        )}
         <div className="absolute top-3 left-3 z-[3] flex flex-col gap-1.5 bg-surface/90 backdrop-blur border border-border rounded-sm px-[11px] py-2 text-[11.5px] text-ink-2">
           <span className="flex items-center gap-1.5">
             <span className="w-2.5 h-2.5 rounded-full bg-forest" />Restaurant
@@ -369,20 +428,20 @@ function DistributorsBody({
             <span className="w-2.5 h-2.5 rounded-full bg-patty" />Distributor
           </span>
         </div>
-        {/* Restaurant pin centered */}
+        {/* Restaurant pin */}
         <div
           className="absolute z-[2] -translate-x-1/2 -translate-y-1/2"
-          style={{ left: "50%", top: "50%" }}
+          style={{ left: `${restaurantPin.xPct}%`, top: `${restaurantPin.yPct}%` }}
         >
           <span className="block w-4 h-4 rounded-full bg-forest border-[3px] border-white shadow-sh2 [animation:pulse-ring_2s_ease-out_infinite]" />
         </div>
-        {data.map((d) => {
-          const { x, y } = project(d.lat, d.lng);
+        {distributors.map((d) => {
+          const { xPct, yPct } = project(d.lat, d.lng);
           return (
             <div
               key={d._id}
               className="absolute z-[2] -translate-x-1/2 -translate-y-1/2 flex flex-col items-center"
-              style={{ left: `${x}%`, top: `${y}%` }}
+              style={{ left: `${xPct}%`, top: `${yPct}%` }}
             >
               <MapPin
                 size={13}
@@ -396,7 +455,7 @@ function DistributorsBody({
           );
         })}
         <div className="absolute bottom-2 right-2.5 z-[3] font-mono text-[10px] text-muted">
-          map · illustrative
+          {mapFailed ? "map · offline" : "map · google"}
         </div>
       </Card>
     </div>
@@ -542,7 +601,7 @@ function RfpBody({ runId, phase }: { runId: Id<"pipelineRuns">; phase: Phase }) 
             <X size={14} />
             <span>
               <b className="font-semibold">Delivery failed</b>
-              {sel.distributorPhone ? ` — trying ${sel.distributorPhone}.` : "."}
+              {sel.distributorPhone ? `. Trying ${sel.distributorPhone}.` : "."}
             </span>
           </div>
         )}
@@ -550,7 +609,21 @@ function RfpBody({ runId, phase }: { runId: Id<"pipelineRuns">; phase: Phase }) 
           <EmailRow k="From" v={<span className="font-mono text-[12.5px]">{sel.fromAddress}</span>} />
           <EmailRow
             k="To"
-            v={<span className="font-mono text-[12.5px]">{sel.toAddress || "(no email)"}</span>}
+            v={
+              sel.toAddress ? (
+                <span className="flex flex-col gap-px leading-tight">
+                  <span className="text-[13px] text-ink-2">{sel.distributorName}</span>
+                  <span
+                    className="font-mono text-[11px] text-muted"
+                    title="Patty reply alias. Distributors reply here; we route the response back to the right thread."
+                  >
+                    via {sel.toAddress}
+                  </span>
+                </span>
+              ) : (
+                <span className="font-mono text-[12.5px]">(no email)</span>
+              )
+            }
           />
           <EmailRow k="Subject" v={<b className="font-medium">{sel.subject}</b>} />
         </div>
@@ -581,7 +654,7 @@ function RfpBody({ runId, phase }: { runId: Id<"pipelineRuns">; phase: Phase }) 
             </table>
           ) : (
             <p className="text-muted text-[12.5px] italic">
-              (No category overlap — no items requested from this distributor.)
+              (No category overlap. No items requested from this distributor.)
             </p>
           )}
           <p className="text-muted">
@@ -672,7 +745,7 @@ function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
           <div className="flex items-center gap-3">
             <Clock size={18} className="text-st-running" />
             <span className="text-[14px] text-ink-2">
-              Quotes are still landing — recommendation will appear here once Patty has enough data.
+              Quotes are still landing. Recommendation will appear here once Patty has enough data.
             </span>
           </div>
         </Card>
@@ -874,22 +947,22 @@ function ComparisonTable({
     {
       k: "Total / wk",
       get: (q: CompTable[number]) =>
-        q.totalPrice == null ? "—" : money(q.totalPrice),
+        q.totalPrice == null ? "–" : money(q.totalPrice),
       mono: true,
     },
     { k: "Completeness", complete: true },
     {
       k: "Delivery",
-      get: (q: CompTable[number]) => q.deliveryTerms || "—",
+      get: (q: CompTable[number]) => q.deliveryTerms || "–",
     },
     {
       k: "Terms",
-      get: (q: CompTable[number]) => q.paymentTerms || "—",
+      get: (q: CompTable[number]) => q.paymentTerms || "–",
       mono: true,
     },
     {
       k: "Lead time",
-      get: (q: CompTable[number]) => q.leadTime || "—",
+      get: (q: CompTable[number]) => q.leadTime || "–",
       mono: true,
     },
   ];
@@ -949,7 +1022,7 @@ function ComparisonTable({
                 >
                   {row.complete ? (
                     nq ? (
-                      <span className="text-faint">—</span>
+                      <span className="text-faint">–</span>
                     ) : (
                       <div className="flex items-center gap-2 w-full">
                         <div className="flex-1 h-1.5 rounded-full bg-surface-3 overflow-hidden min-w-[40px]">

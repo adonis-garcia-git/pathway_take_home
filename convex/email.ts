@@ -252,7 +252,7 @@ export const runSendRfps = internalAction({
       if (linesForDist.length === 0) continue;
 
       const note =
-        dist.email.trim().length === 0 ? "no email — Places discovery" : undefined;
+        dist.email.trim().length === 0 ? "no email. Places discovery" : undefined;
       const recipientId: Id<"rfpRecipients"> = await ctx.runMutation(
         internal.email.upsertQueuedRecipient,
         { rfpId, distributorId: dist._id, replyAddress, note },
@@ -622,7 +622,7 @@ export const simulateInboundReply = action({
     const messageId = `sim:${Math.random().toString(36).slice(2, 14)}:${Date.now()}`;
     const body =
       bodyText ??
-      "Hi! Thanks for the RFP. Pricing attached inline:\n- San Marzano tomato: $2.10/lb\n- Parmigiano Reggiano: $18/lb\nLead time 2 days, $250 min order.\n— A. Supplier";
+      "Hi! Thanks for the RFP. Pricing attached inline:\n- San Marzano tomato: $2.10/lb\n- Parmigiano Reggiano: $18/lb\nLead time 2 days, $250 min order.\nA. Supplier";
     const result: { quoteId: Id<"quotes"> | null } = await ctx.runMutation(
       internal.quotes.recordInboundQuote,
       {

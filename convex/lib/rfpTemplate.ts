@@ -51,7 +51,7 @@ export function buildRfpHtml(input: RfpTemplateInput): string {
   return `<!doctype html>
 <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:640px;margin:0 auto;padding:24px;">
   <p>Hi ${escapeHtml(input.distributorName)},</p>
-  <p>This is Patty, the procurement assistant for <strong>${escapeHtml(input.restaurantName)}</strong> (${escapeHtml(input.restaurantAddress)}). We're requesting a quote on the items below — <strong>please reply to this email with your price per line by ${escapeHtml(formatDeadline(input.deadline))}.</strong></p>
+  <p>This is Patty, the procurement assistant for <strong>${escapeHtml(input.restaurantName)}</strong> (${escapeHtml(input.restaurantAddress)}). We're requesting a quote on the items below. <strong>Please reply to this email with your price per line by ${escapeHtml(formatDeadline(input.deadline))}.</strong></p>
   <table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;">
     <thead>
       <tr style="background:#f5f5f5;">
@@ -63,13 +63,13 @@ export function buildRfpHtml(input: RfpTemplateInput): string {
     <tbody>${rows}
     </tbody>
   </table>
-  <p style="color:#555;font-size:13px;">A reply in plain text is fine — our system will parse it. Thanks!</p>
-  <p>— Patty, on behalf of ${escapeHtml(input.restaurantName)}</p>
+  <p style="color:#555;font-size:13px;">A reply in plain text is fine. Our system will parse it. Thanks!</p>
+  <p>Patty, on behalf of ${escapeHtml(input.restaurantName)}</p>
 </body></html>`;
 }
 
 export function buildRfpSubject(restaurantName: string): string {
-  return `RFP — Weekly produce & dry goods for ${restaurantName}`;
+  return `RFP: weekly produce and dry goods for ${restaurantName}`;
 }
 
 // ── Follow-up templates (Phase 6) ────────────────────────────────
@@ -109,12 +109,12 @@ export function buildMissingInfoHtml(input: MissingInfoTemplateInput): string {
     </tbody>
   </table>
   <p>Please reply by ${escapeHtml(formatDeadline(input.deadline))}.</p>
-  <p>— Patty</p>
+  <p>Patty</p>
 </body></html>`;
 }
 
 export function buildMissingInfoSubject(restaurantName: string): string {
-  return `Re: RFP — a few missing prices for ${restaurantName}`;
+  return `Re: RFP: a few missing prices for ${restaurantName}`;
 }
 
 export interface NudgeTemplateInput {
@@ -127,11 +127,11 @@ export function buildNudgeHtml(input: NudgeTemplateInput): string {
   return `<!doctype html>
 <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:640px;margin:0 auto;padding:24px;">
   <p>Hi ${escapeHtml(input.distributorName)},</p>
-  <p>Quick nudge on the RFP for <strong>${escapeHtml(input.restaurantName)}</strong> — we haven't received a quote yet and the deadline is ${escapeHtml(formatDeadline(input.deadline))}. Even a partial reply or a "we can't fill this" is helpful for our award decision.</p>
-  <p>— Patty</p>
+  <p>Quick nudge on the RFP for <strong>${escapeHtml(input.restaurantName)}</strong>. We haven't received a quote yet and the deadline is ${escapeHtml(formatDeadline(input.deadline))}. Even a partial reply or a "we can't fill this" is helpful for our award decision.</p>
+  <p>Patty</p>
 </body></html>`;
 }
 
 export function buildNudgeSubject(restaurantName: string): string {
-  return `Re: RFP — quick nudge for ${restaurantName}`;
+  return `Re: RFP: quick nudge for ${restaurantName}`;
 }

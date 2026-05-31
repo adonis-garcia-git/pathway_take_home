@@ -408,7 +408,10 @@ export const getDistributorsForRun = query({
     // closest first
     out.sort((a, b) => a.distanceMi - b.distanceMi);
     // cap to 20 for UI clarity
-    return out.slice(0, 20);
+    return {
+      restaurant: { lat: restaurant.lat, lng: restaurant.lng },
+      distributors: out.slice(0, 20),
+    };
   },
 });
 

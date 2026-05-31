@@ -12,7 +12,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { withTimeout, withRetry } from "./net";
+import { withRetry, TimeoutError } from "./net";
 import {
   MenuExtractionSchema,
   QuoteExtractionSchema,
@@ -89,39 +89,55 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
     },
   ];
 
-  // 30s deadline (Claude can be slow on PDFs); 1 retry on overload (529)
-  // or transient network errors. 4xx (bad key, bad prompt) is permanent.
-  const callClaude = (messages: Anthropic.Messages.MessageParam[]) =>
-    withRetry(
-      () =>
-        withTimeout(
-          client.messages.create({
-            model: MODEL,
-            max_tokens: MAX_TOKENS,
-            system: opts.systemPrompt,
-            tools: [tool],
-            tool_choice: { type: "tool", name: opts.toolName },
-            messages,
-          }),
-          30_000,
-          "anthropic.messages.create",
-        ),
-      {
-        attempts: 2,
-        baseMs: 500,
-        label: "anthropic.messages.create",
-        retryOn: (err) => {
-          if (err instanceof Error && err.name === "TimeoutError") return true;
-          // Anthropic SDK throws APIError with .status; 529 = overload, 5xx = transient
-          const status = (err as { status?: number })?.status;
-          if (typeof status === "number") return status === 529 || status >= 500;
-          return false;
+  // 90s deadline (Claude with tool-use on multimodal menus can run long);
+  // 1 retry on overload (529) or transient network errors. 4xx is permanent.
+  // We pass `signal` so the underlying fetch is actually cancelled on
+  // timeout, not left dangling (Convex flags dangling promises).
+  const callClaude = async (messages: Anthropic.Messages.MessageParam[]) => {
+    const TIMEOUT_MS = 90_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      return await client.messages.create(
+        {
+          model: MODEL,
+          max_tokens: MAX_TOKENS,
+          system: opts.systemPrompt,
+          tools: [tool],
+          tool_choice: { type: "tool", name: opts.toolName },
+          messages,
         },
+        { signal: controller.signal, timeout: TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (
+        controller.signal.aborted ||
+        (err instanceof Error && (err.name === "AbortError" || err.name === "APIUserAbortError"))
+      ) {
+        throw new TimeoutError("anthropic.messages.create", TIMEOUT_MS);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const callClaudeRetried = (messages: Anthropic.Messages.MessageParam[]) =>
+    withRetry(() => callClaude(messages), {
+      attempts: 2,
+      baseMs: 500,
+      label: "anthropic.messages.create",
+      retryOn: (err) => {
+        if (err instanceof Error && err.name === "TimeoutError") return true;
+        // Anthropic SDK throws APIError with .status; 529 = overload, 5xx = transient
+        const status = (err as { status?: number })?.status;
+        if (typeof status === "number") return status === 529 || status >= 500;
+        return false;
       },
-    );
+    });
 
   // ── attempt 1 ─────────────────────────────────────────────────
-  const first = await callClaude(baseMessages);
+  const first = await callClaudeRetried(baseMessages);
 
   const firstToolUse = findToolUse(first.content);
   if (!firstToolUse) {
@@ -162,7 +178,7 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
     },
   ];
 
-  const second = await callClaude(retryMessages);
+  const second = await callClaudeRetried(retryMessages);
 
   const secondToolUse = findToolUse(second.content);
   if (!secondToolUse) {
@@ -179,19 +195,31 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
   return secondParse.data;
 }
 
+// ── Shared style guidance ────────────────────────────────────────
+
+// Applied to every Claude call in this file. Em dashes are banned project-wide
+// in user-facing text (see CLAUDE.md "Typography"); the model copies its
+// prompt's punctuation habits into its outputs, so we tell it explicitly.
+const NO_EM_DASH_RULE =
+  "Style: do not use em dashes (—, U+2014) anywhere in your output. " + // allow-em-dash
+  "Use periods, commas, semicolons, colons, or parentheses instead. " +
+  "This applies to every string field including headlines, rationales, dish names, descriptions, and notes.";
+
 // ── extractMenu (Phase 5) ────────────────────────────────────────
 
 const MENU_SYSTEM = `You are an experienced restaurant chef helping a procurement agent decompose menus into ingredient baskets.
 
-For every dish on the menu, list every distinct ingredient needed for a SINGLE SERVING (one plate). Menus never list quantities — use your chef judgement to estimate. State your key assumption when confidence is medium or low.
+For every dish on the menu, list every distinct ingredient needed for a SINGLE SERVING (one plate). Menus never list quantities. Use your chef judgement to estimate. State your key assumption when confidence is medium or low.
 
 Be conservative with confidence. Vague dish names, house specials with no description, or ambiguous cuts should be flagged with confidence:"low" + needsReview:true. Procurement decisions cascade off these flags.
 
-canonicalName must be SINGULAR, lowercased, and brand/cultivar/grade stripped so we can dedup across dishes. Examples: "San Marzano tomatoes" → "tomato"; "fresh mozzarella di bufala" → "mozzarella cheese"; "EVOO" → "olive oil"; "ground beef (80/20)" → "ground beef".
+canonicalName must be SINGULAR, lowercased, and brand/cultivar/grade stripped so we can dedup across dishes. Examples: "San Marzano tomatoes" -> "tomato"; "fresh mozzarella di bufala" -> "mozzarella cheese"; "EVOO" -> "olive oil"; "ground beef (80/20)" -> "ground beef".
 
 Skip section headers ("Antipasti"), prices, allergen notes, and footers.
 
-Always call the record_menu tool to return results — never reply with prose.`;
+Always call the record_menu tool to return results. Never reply with prose.
+
+${NO_EM_DASH_RULE}`;
 
 export async function extractMenu(content: MenuContent): Promise<MenuExtraction> {
   return forcedToolCall({
@@ -208,11 +236,11 @@ export async function extractMenu(content: MenuContent): Promise<MenuExtraction>
 
 const QUOTE_SYSTEM = `You are a procurement analyst extracting a structured quote from a distributor's free-text email reply to our RFP.
 
-We will give you (1) the basket we asked them to quote — a list of {canonicalName, quantity, unit} — and (2) the distributor's reply text (already stripped of quoted history).
+We will give you (1) the basket we asked them to quote (a list of {canonicalName, quantity, unit}) and (2) the distributor's reply text (already stripped of quoted history).
 
 For every basket line the distributor responded to, emit a QuoteLine. For lines they explicitly said they don't carry / are out of stock: set available:false and price:null. If they quoted a price without saying anything about availability: assume available:true.
 
-canonicalName MUST match our basket's canonical names whenever you're confident (e.g. their "San Marzano DOP" → our "tomato"). When unsure, use your best singular common-noun guess; the caller will reconcile.
+canonicalName MUST match our basket's canonical names whenever you're confident (e.g. their "San Marzano DOP" maps to our "tomato"). When unsure, use your best singular common-noun guess; the caller will reconcile.
 
 Set missingInfo:true if ANY basket line is absent from the reply OR a quoted line lacks a price. This flags an autonomous follow-up.
 
@@ -220,7 +248,9 @@ Extract deliveryTerms / paymentTerms / leadTime verbatim when stated. totalPrice
 
 Be conservative with parseConfidence: "low" if the reply is short/ambiguous, "high" only when every basket line was addressed with a clear price+unit.
 
-Always call the record_quote tool — never reply with prose.`;
+Always call the record_quote tool. Never reply with prose.
+
+${NO_EM_DASH_RULE}`;
 
 export async function parseQuoteReply(
   rawEmailBody: string,
@@ -252,11 +282,13 @@ export async function parseQuoteReply(
 
 const RATIONALE_SYSTEM = `You are a procurement analyst writing a brief, candid award rationale for a restaurant client.
 
-You will be given a recommendation draft: the top distributor (or null), any complementary splits, gaps, estimated savings vs USDA baseline, and approval flags. Write a one-sentence headline (≤ 90 chars) and a 2–3 sentence rationale grounded in price, basket coverage, and payment/delivery terms.
+You will be given a recommendation draft: the top distributor (or null), any complementary splits, gaps, estimated savings vs USDA baseline, and approval flags. Write a one-sentence headline (≤ 90 chars) and a 2 to 3 sentence rationale grounded in price, basket coverage, and payment/delivery terms.
 
 If needsHumanApproval is true, name the specific reason in the rationale (thin margin, low completeness, missing info, no viable quote).
 
-Always call the record_rationale tool — never reply with prose.`;
+Always call the record_rationale tool. Never reply with prose.
+
+${NO_EM_DASH_RULE}`;
 
 interface RationaleInput {
   primary?: {

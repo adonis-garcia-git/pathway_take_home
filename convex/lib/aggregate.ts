@@ -217,7 +217,7 @@ export function aggregateIngredients(dishes: ParsedDish[]): AggregatedIngredient
         unit: m.unit,
         confidence: m.confidence,
         assumptionNote: mixedDims
-          ? (m.assumptionNote ? `${m.assumptionNote} · mixed units — confirm` : "mixed units — confirm")
+          ? (m.assumptionNote ? `${m.assumptionNote} · mixed units. Confirm.` : "mixed units. Confirm.")
           : m.assumptionNote,
       })),
     });

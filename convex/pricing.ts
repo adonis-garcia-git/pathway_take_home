@@ -26,6 +26,7 @@ import {
   CONFIDENCE_THRESHOLD,
   PRIMARY_REPORT_BY_CATEGORY,
   SECONDARY_REPORT_BY_CATEGORY,
+  weakMatches,
   type Category,
   type ReportSlug,
 } from "./lib/fuzzy";
@@ -43,6 +44,21 @@ const sourceValidator = v.union(
  * Upsert keyed by (ingredientId, reportDate). The schema index
  * `by_ingredient_and_reportDate` makes this O(1).
  */
+const estimationDetailValidator = v.object({
+  method: v.union(v.literal("neighbors"), v.literal("category")),
+  category: v.optional(v.string()),
+  contributingReports: v.optional(
+    v.array(
+      v.object({
+        commodity: v.string(),
+        price: v.number(),
+        confidence: v.number(),
+        region: v.optional(v.string()),
+      }),
+    ),
+  ),
+});
+
 export const upsertIngredientPrice = internalMutation({
   args: {
     ingredientId: v.id("ingredients"),
@@ -58,6 +74,7 @@ export const upsertIngredientPrice = internalMutation({
     unmatched: v.boolean(),
     trend: v.optional(v.number()),
     rawUsdaPayload: v.optional(v.any()),
+    estimationDetail: v.optional(estimationDetailValidator),
   },
   handler: async (ctx, args) => {
     const existing = await ctx.db
@@ -108,6 +125,17 @@ async function runWithConcurrency<T, R>(
 
 // ── Pure helpers ───────────────────────────────────────────────────────────
 
+interface EstimationDetail {
+  method: "neighbors" | "category";
+  category?: string;
+  contributingReports?: {
+    commodity: string;
+    price: number;
+    confidence: number;
+    region?: string;
+  }[];
+}
+
 interface PricedResult {
   source: "usda_mars" | "estimated" | "mock";
   price?: number;
@@ -121,6 +149,7 @@ interface PricedResult {
   unmatched: boolean;
   trend?: number;
   rawUsdaPayload?: unknown;
+  estimationDetail?: EstimationDetail;
 }
 
 function today(): string {
@@ -133,7 +162,8 @@ function categoryFallback(
   source: "estimated" | "mock",
   matchConfidence: number,
 ): PricedResult {
-  const avg = CATEGORY_AVG_PRICE[ingredient.category as Category];
+  const category = ingredient.category as Category;
+  const avg = CATEGORY_AVG_PRICE[category];
   return {
     source,
     price: avg.price,
@@ -144,6 +174,76 @@ function categoryFallback(
     // to match. "estimated" means we matched too weakly to trust the number.
     unmatched: source === "estimated",
     trend: undefined,
+    estimationDetail:
+      source === "estimated"
+        ? { method: "category", category }
+        : undefined,
+  };
+}
+
+/** Plain numeric median; small enough to inline but reads cleaner this way. */
+function median(nums: number[]): number {
+  const xs = [...nums].sort((a, b) => a - b);
+  const n = xs.length;
+  if (n === 0) return 0;
+  if (n % 2 === 1) return xs[(n - 1) / 2];
+  return (xs[n / 2 - 1] + xs[n / 2]) / 2;
+}
+
+/**
+ * When the primary report's best match is too weak to trust, try to derive a
+ * neighbor-median estimate from 2+ near-misses in the same report. Returns
+ * null if there aren't enough qualifying weak matches with usable prices.
+ */
+function tryNeighborMedian(
+  ingredient: Doc<"ingredients">,
+  rows: NormalizedRow[],
+): PricedResult | null {
+  if (rows.length === 0) return null;
+  const byDate = groupRowsByDateDesc(rows);
+  const dates = [...byDate.keys()];
+  if (dates.length === 0) return null;
+  const latestRows = byDate.get(dates[0]) ?? [];
+  const weaks = weakMatches(ingredient.canonicalName, latestRows);
+
+  const priced = weaks
+    .map(({ candidate, confidence }) => {
+      const p =
+        candidate.weightedAvg ??
+        (candidate.priceRangeLow != null && candidate.priceRangeHigh != null
+          ? (candidate.priceRangeLow + candidate.priceRangeHigh) / 2
+          : null);
+      return p != null ? { candidate, confidence, price: p } : null;
+    })
+    .filter((x): x is { candidate: NormalizedRow; confidence: number; price: number } => x !== null);
+
+  if (priced.length < 2) return null;
+
+  // Anchor unit on the highest-confidence weak match. Only count contributors
+  // with the same unit so we don't average $/lb with $/dozen.
+  const anchorUnit = priced[0].candidate.unit;
+  const sameUnit = priced.filter((p) => p.candidate.unit === anchorUnit);
+  if (sameUnit.length < 2) return null;
+
+  const top = sameUnit.slice(0, 5);
+  const med = median(top.map((p) => p.price));
+  return {
+    source: "estimated",
+    price: Math.round(med * 100) / 100,
+    unit: anchorUnit || ingredient.defaultUnit,
+    reportDate: dates[0],
+    matchConfidence: top[0].confidence,
+    unmatched: true,
+    trend: undefined,
+    estimationDetail: {
+      method: "neighbors",
+      contributingReports: top.map((p) => ({
+        commodity: p.candidate.commodity,
+        price: Math.round(p.price * 100) / 100,
+        confidence: Math.round(p.confidence * 100) / 100,
+        region: p.candidate.region,
+      })),
+    },
   };
 }
 
@@ -235,11 +335,20 @@ async function priceOneIngredient(
   const primaryHit = tryMatchReport(ingredient, primaryRows);
   if (primaryHit) return primaryHit;
 
+  let secondaryRows: NormalizedRow[] = [];
   if (secondary) {
-    const secondaryRows = await getReport(secondary);
+    secondaryRows = await getReport(secondary);
     const secondaryHit = tryMatchReport(ingredient, secondaryRows);
     if (secondaryHit) return secondaryHit;
   }
+
+  // No clean match on either report. Before defaulting to a static category
+  // average, look for a cluster of weak USDA matches and take their median.
+  // Try the primary report first (richer for the category), then secondary.
+  const neighborHit =
+    tryNeighborMedian(ingredient, primaryRows) ??
+    tryNeighborMedian(ingredient, secondaryRows);
+  if (neighborHit) return neighborHit;
 
   // Best-effort: compute a weak match confidence on the primary report to
   // record alongside the fallback price.
@@ -317,6 +426,7 @@ export const fetchAllPricesAction = internalAction({
         unmatched: result.unmatched,
         trend: result.trend,
         rawUsdaPayload: result.rawUsdaPayload,
+        estimationDetail: result.estimationDetail,
       });
     });
 
@@ -343,7 +453,10 @@ function provenanceFromSource(src: PriceProv): Provenance {
 function sourceLabel(row: Doc<"ingredientPrices">): string {
   if (row.source === "usda_mars") return `USDA MARS · ${row.region ?? "national"}`;
   if (row.source === "usda_nass") return `USDA NASS · ${row.region ?? "national"}`;
-  if (row.source === "estimated") return "Estimated (category avg)";
+  if (row.source === "estimated") {
+    if (row.estimationDetail?.method === "neighbors") return "Estimated · USDA neighbors";
+    return "Estimated · category avg";
+  }
   return "Mock (category avg)";
 }
 
@@ -406,6 +519,7 @@ export const getPricingForRun = query({
       trend: number | null;
       provenance: Provenance;
       sourceLabel: string;
+      estimationDetail?: Doc<"ingredientPrices">["estimationDetail"];
       flag?: string;
     };
 
@@ -449,6 +563,7 @@ export const getPricingForRun = query({
         trend: p.trend ?? null,
         provenance: provenanceFromSource(p.source),
         sourceLabel: sourceLabel(p),
+        estimationDetail: p.estimationDetail,
         flag: p.unmatched ? "weak match" : undefined,
       });
     }

@@ -97,6 +97,25 @@ export default defineSchema({
     unmatched: v.boolean(),
     trend: v.optional(v.number()),
     rawUsdaPayload: v.optional(v.any()),
+    // Provenance for source = "estimated". When "neighbors", we computed
+    // the median of weak USDA matches; when "category", we used the static
+    // category-average table. Older rows lack this field (optional).
+    estimationDetail: v.optional(
+      v.object({
+        method: v.union(v.literal("neighbors"), v.literal("category")),
+        category: v.optional(v.string()),
+        contributingReports: v.optional(
+          v.array(
+            v.object({
+              commodity: v.string(),
+              price: v.number(),
+              confidence: v.number(),
+              region: v.optional(v.string()),
+            }),
+          ),
+        ),
+      }),
+    ),
   })
     .index("by_ingredientId", ["ingredientId"])
     .index("by_ingredient_and_reportDate", ["ingredientId", "reportDate"]),

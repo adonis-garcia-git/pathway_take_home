@@ -35,7 +35,7 @@ export const IngredientExtractionSchema = z.object({
     .number()
     .positive()
     .describe(
-      "Estimated raw quantity needed for ONE serving of this dish — one plate, not a week's worth, not for the whole menu. Use experienced-chef judgement.",
+      "Estimated raw quantity needed for ONE serving of this dish (one plate, not a week's worth, not for the whole menu). Use experienced-chef judgement.",
     ),
   unit: z
     .string()
@@ -91,7 +91,7 @@ export type Category = z.infer<typeof Category>;
 export const QuoteLineSchema = z.object({
   rawName: z
     .string()
-    .describe("Exact line text as written by the distributor (e.g. 'San Marzano tomatoes — $3.20/lb')."),
+    .describe("Exact line text as written by the distributor (e.g. 'San Marzano tomatoes at $3.20/lb')."),
   canonicalName: z
     .string()
     .describe(

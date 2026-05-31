@@ -1,4 +1,4 @@
-# Pathway RFP Pipeline — Project Doctrine
+# Pathway RFP Pipeline · Project Doctrine
 
 > Read this first. Every contributor and every Claude subagent reads this on entry. Keep it short, current, and prescriptive.
 
@@ -55,6 +55,15 @@ The UI is a near-pure render of run state. The pipeline animation in the design 
 - **Zod schemas live in `convex/lib/schemas.ts`** and are reused by both LLM output validation and action args where natural.
 - **Naming:** Convex files plural (`runs.ts`, `quotes.ts`); functions named `getRun`, `listRuns`, `startRun`, `appendStageEvent`, `sendRfp`.
 - **No client → external IO.** Browser only talks to Convex.
+
+## Typography
+
+- **No em dashes (`—`, U+2014) in user-facing text.** This covers UI copy, button labels, placeholders, email subjects/bodies, error messages, step `summary` strings, sample data, LLM system prompts, and any Zod `.describe()` hint the model can read.
+- **Default replacement is a period** (split into two sentences). Use a comma, semicolon, or colon only when the second clause is grammatically dependent on the first.
+- **Use en dashes (`–`, U+2013) for null/empty placeholders and numeric ranges**, never em dashes.
+- **When writing any LLM system prompt, append the project's `NO_EM_DASH_RULE`** (defined once in `convex/lib/anthropic.ts`). The model copies its prompt's punctuation habits, so we have to tell it explicitly.
+- **Enforced by `scripts/check-em-dashes.mjs`**, which runs as part of `pnpm lint`. Comments (`//`, `*`, `{/* */}`) are skipped; the rare line that needs a literal em dash to *describe* the rule can opt out with a trailing `// allow-em-dash` annotation.
+- **This rule also applies to assistant text responses** (chat replies, commit messages, PR descriptions, generated docs). Use the same replacements when writing prose for the user.
 
 ## Environment variables
 

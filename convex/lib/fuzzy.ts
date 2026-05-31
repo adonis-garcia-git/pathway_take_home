@@ -111,3 +111,30 @@ export function bestMatch<T extends Candidate>(
   }
   return { candidate: best, confidence: bestScore };
 }
+
+/** Lower bound of "weak but real" match window. Below this is noise. */
+export const WEAK_MATCH_LOWER = 0.4;
+
+/**
+ * Return every candidate whose score falls inside [WEAK_MATCH_LOWER,
+ * CONFIDENCE_THRESHOLD). Sorted by confidence descending. Used by the
+ * fallback path to derive a neighbor-median estimate when we don't have
+ * a clean single match but DO have a cluster of near-misses.
+ */
+export function weakMatches<T extends Candidate>(
+  canonicalName: string,
+  candidates: readonly T[],
+): { candidate: T; confidence: number }[] {
+  const { head, modifier } = splitHeadAndModifier(canonicalName);
+  const out: { candidate: T; confidence: number }[] = [];
+  for (const c of candidates) {
+    const headSim = similarity(head, c.commodity);
+    const varietySim = modifier && c.variety ? similarity(modifier, c.variety) : null;
+    const score = varietySim === null ? headSim : (headSim + varietySim) / 2;
+    if (score >= WEAK_MATCH_LOWER && score < CONFIDENCE_THRESHOLD) {
+      out.push({ candidate: c, confidence: score });
+    }
+  }
+  out.sort((a, b) => b.confidence - a.confidence);
+  return out;
+}

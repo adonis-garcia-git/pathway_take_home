@@ -143,7 +143,7 @@ export function CatTag({ cat }: { cat: Category }) {
 
 /* ───────────────────────── Trend ───────────────────────── */
 export function Trend({ pct }: { pct: number | null | undefined }) {
-  if (pct === null || pct === undefined) return <span className="font-mono text-faint text-[12px]">—</span>;
+  if (pct === null || pct === undefined) return <span className="font-mono text-faint text-[12px]">–</span>;
   const flat = Math.abs(pct) < 0.05;
   const up = pct > 0;
   const Icon = flat ? Minus : up ? ArrowUp : ArrowDown;

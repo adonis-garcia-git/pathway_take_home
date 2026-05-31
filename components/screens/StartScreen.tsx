@@ -11,21 +11,21 @@ import {
   cn, Button, IconField, TextArea, Segmented, LinkButton, Patty, PattyAvatar, ReviewStrip,
 } from "@/components/ui";
 
-const SAMPLE_MENU = `TRATTORIA LUCIA — Menu
+const SAMPLE_MENU = `TRATTORIA LUCIA · Menu
 
 ANTIPASTI
-· Insalata Caprese — mozzarella di bufala, heirloom tomato, basil, EVOO
-· Bruschetta al Pomodoro — rustic bread, tomato, garlic, basil
+· Insalata Caprese: mozzarella di bufala, heirloom tomato, basil, EVOO
+· Bruschetta al Pomodoro: rustic bread, tomato, garlic, basil
 
 PRIMI
-· Tagliatelle al Ragù — beef & pork ragù, San Marzano, parmigiano
-· Cacio e Pepe — spaghetti, pecorino romano, black pepper
+· Tagliatelle al Ragù: beef and pork ragù, San Marzano, parmigiano
+· Cacio e Pepe: spaghetti, pecorino romano, black pepper
 
 SECONDI
-· Osso Buco alla Milanese — veal shank, soffritto, white wine
+· Osso Buco alla Milanese: veal shank, soffritto, white wine
 
 DOLCI
-· Tiramisù della Casa — mascarpone, espresso, savoiardi, cocoa`;
+· Tiramisù della Casa: mascarpone, espresso, savoiardi, cocoa`;
 
 const SAMPLE_NAME = "Trattoria Lucia";
 const SAMPLE_ADDRESS = "214 Court St, Carroll Gardens, Brooklyn, NY 11231";
@@ -116,7 +116,7 @@ export function StartScreen({ onRun }: { onRun: (runId: Id<"pipelineRuns">) => v
           <Patty size={15} /> Patty · RFP Pipeline
         </div>
         <h1 className="font-serif text-[46px] max-md:text-[36px] leading-[1.08] font-medium tracking-[-0.022em] text-ink mb-[18px] text-balance">
-          Turn your menu into the<br />best suppliers — automatically.
+          Turn your menu into the<br />best suppliers, automatically.
         </h1>
         <p className="text-[16.5px] leading-relaxed text-muted max-w-[60ch] mx-auto text-pretty">
           Patty parses your menu into an ingredient basket, prices it against market data, finds local distributors, sends the RFPs, and brings back a recommendation. Give her a menu and an address.
@@ -166,12 +166,12 @@ export function StartScreen({ onRun }: { onRun: (runId: Id<"pipelineRuns">) => v
               <div className="flex flex-col gap-2">
                 <TextArea
                   rows={8}
-                  placeholder="Paste your menu here — dish names and descriptions are enough."
+                  placeholder="Paste your menu here. Dish names and descriptions are enough."
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                 />
                 <p className="text-[12.5px] text-muted">
-                  {text.trim() ? `${text.trim().split(/\n/).length} lines` : "Dishes, sections, descriptions — Patty handles the rest."}
+                  {text.trim() ? `${text.trim().split(/\n/).length} lines` : "Dishes, sections, descriptions. Patty handles the rest."}
                 </p>
               </div>
             )}
@@ -211,7 +211,7 @@ export function StartScreen({ onRun }: { onRun: (runId: Id<"pipelineRuns">) => v
                 ) : (
                   <div className="flex flex-col items-center gap-0.5">
                     <span className="font-medium text-[14px]">Drop a photo or PDF of the menu</span>
-                    <span className="text-[12.5px] text-muted">PNG · JPG · PDF — or click to browse</span>
+                    <span className="text-[12.5px] text-muted">PNG · JPG · PDF. Click to browse.</span>
                   </div>
                 )}
               </div>
@@ -269,26 +269,29 @@ export function StartScreen({ onRun }: { onRun: (runId: Id<"pipelineRuns">) => v
           <div className="text-[11px] font-semibold tracking-[0.09em] uppercase text-muted mb-4">
             What Patty does
           </div>
-          <ol className="list-none m-0 p-0 flex flex-col gap-0.5">
+          <ol className="relative list-none m-0 p-0 flex flex-col">
+            {/* Single continuous rail centered behind the icon column. Icons */}
+            {/* sit z-stacked on top so the rail is visually segmented by them. */}
+            <span
+              aria-hidden
+              className="absolute left-[44.5px] top-[26px] bottom-[26px] w-px bg-border-strong/55"
+            />
             {steps.map((s, i) => (
-              <li key={s.t} className="relative flex items-center gap-3 py-[9px]">
+              <li key={s.t} className="relative flex items-center gap-3 py-[11px]">
                 <span className="font-mono text-[11.5px] text-faint w-[18px] shrink-0">
                   {String(i + 1).padStart(2, "0")}
                 </span>
-                <span className="w-[30px] h-[30px] rounded-sm shrink-0 z-[1] inline-flex items-center justify-center bg-mint text-forest border border-forest/10">
+                <span className="relative z-[1] w-[30px] h-[30px] rounded-sm shrink-0 inline-flex items-center justify-center bg-mint text-forest border border-forest/10">
                   <s.ic size={15} />
                 </span>
                 <span className="text-[14px] font-medium text-ink">{s.t}</span>
-                {i < steps.length - 1 && (
-                  <span className="absolute left-[33px] top-[38px] -bottom-0.5 w-[1.5px] bg-border-strong" />
-                )}
               </li>
             ))}
           </ol>
           <div className="flex gap-3 items-start mt-[18px] pt-[18px] border-t border-border">
             <PattyAvatar size={28} />
             <p className="m-0 text-[13px] leading-relaxed text-muted">
-              Every number is tagged with where it came from — <b className="text-ink font-medium">USDA-verified</b>, <b className="text-ink font-medium">estimated</b>, or <b className="text-ink font-medium">no data</b>. Patty flags anything that needs a human.
+              Every number is tagged with where it came from: <b className="text-ink font-medium">USDA-verified</b>, <b className="text-ink font-medium">estimated</b>, or <b className="text-ink font-medium">no data</b>. Patty flags anything that needs a human.
             </p>
           </div>
         </aside>

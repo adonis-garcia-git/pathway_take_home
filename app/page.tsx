@@ -59,7 +59,7 @@ function TopbarRunChip({ runId }: { runId: Id<"pipelineRuns"> }) {
   return (
     <>
       <span className="w-px h-6 bg-border-strong" />
-      <span className="inline-flex items-center gap-2.5 text-[13px] text-ink-2 bg-surface border border-border rounded-full pl-3 pr-2 py-[5px]">
+      <span className="inline-flex items-center gap-3 text-[13px] text-ink-2 bg-surface border border-border rounded-full pl-3.5 pr-3.5 py-1.5">
         <Patty size={16} />
         <span className="flex flex-col gap-px leading-tight">
           <span className="font-medium">{header.restaurantName}</span>

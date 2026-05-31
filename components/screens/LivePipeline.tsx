@@ -10,10 +10,49 @@ import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { cn, StatusBadge, PattyAvatar, Skeleton } from "@/components/ui";
+import { PattySpinner } from "@/components/PattySpinner";
 import { STAGE_META, type StageKey, type StageStatus } from "@/lib/data";
 import {
   RecipesPanel, PricingPanel, DistributorsPanel, RfpPanel, QuotesPanel,
 } from "@/components/screens/stages";
+
+const PATTY_LINES: Record<StageKey, string[]> = {
+  parse_menu: [
+    "Cracking open the menu.",
+    "Counting tomatoes so you don't have to.",
+    "Pretending I know what bottarga is.",
+    "Decoding the chef's poetry.",
+    "Pairing dishes with their secret ingredients.",
+  ],
+  fetch_pricing: [
+    "Stalking USDA market reports.",
+    "Haggling with the spreadsheet.",
+    "Asking the produce ghost for prices.",
+    "Looking up wholesale tomato gossip.",
+    "Bargaining with imaginary farmers.",
+  ],
+  find_distributors: [
+    "Sniffing out suppliers near you.",
+    "Cold calling the universe.",
+    "Checking who delivers before noon.",
+    "Finding the cheese person.",
+    "Knocking on warehouse doors.",
+  ],
+  send_rfps: [
+    "Penning earnest emails.",
+    "Forging my own signature.",
+    "Hitting send and crossing fingers.",
+    "Distributing the distribution.",
+    "Whispering nice things to inboxes.",
+  ],
+  collect_quotes: [
+    "Reading replies like a hawk.",
+    "Squinting at prices.",
+    "Working out who wins dinner.",
+    "Doing arithmetic in clogs.",
+    "Picking favorites, fairly.",
+  ],
+};
 
 const STAGE_ICONS: LucideIcon[] = [Sprout, Tag, MapPin, Send, Award];
 const PANELS = [RecipesPanel, PricingPanel, DistributorsPanel, RfpPanel, QuotesPanel];
@@ -43,7 +82,7 @@ function pattyLine(runningKey: StageKey | null, allDone: boolean): {
   }
   if (!runningKey) return { live: true, text: "Starting up…" };
   const map: Record<StageKey, React.ReactNode> = {
-    parse_menu: <>Reading the menu — extracting dishes into an ingredient basket.</>,
+    parse_menu: <>Reading the menu. Extracting dishes into an ingredient basket.</>,
     fetch_pricing: <>Pricing the basket against <b className="text-ink font-medium">USDA</b> market data.</>,
     find_distributors: <>Searching local distributors and matching by category.</>,
     send_rfps: <>Emailing distributors for quotes.</>,
@@ -360,7 +399,11 @@ function StageDetail({
         </div>
       </div>
       <div key={meta.key + phase} className="min-h-[120px]">
-        <Panel phase={phase} runId={runId} error={error} />
+        {phase === "running" ? (
+          <PattySpinner lines={PATTY_LINES[meta.key as StageKey]} />
+        ) : (
+          <Panel phase={phase} runId={runId} error={error} />
+        )}
       </div>
     </div>
   );
