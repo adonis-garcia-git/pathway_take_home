@@ -66,10 +66,36 @@ const fmtElapsed = (ms: number) => {
   return `${m}m ${r}s`;
 };
 
-function pattyLine(runningKey: StageKey | null, allDone: boolean): {
+const STAGE_TITLES: Record<StageKey, string> = {
+  parse_menu: "Parse Menu",
+  fetch_pricing: "Fetch Pricing",
+  find_distributors: "Find Distributors",
+  send_rfps: "Send RFPs",
+  collect_quotes: "Collect Quotes",
+};
+
+function pattyLine(
+  runningKey: StageKey | null,
+  allDone: boolean,
+  phases: StageStatus[],
+): {
   live: boolean;
   text: React.ReactNode;
 } {
+  // Special case: stages 2 and 3 run in parallel. When both are simultaneously
+  // running, show a combined line instead of just naming the first one.
+  const pricingRunning = phases[1] === "running";
+  const distributorsRunning = phases[2] === "running";
+  if (pricingRunning && distributorsRunning) {
+    return {
+      live: true,
+      text: (
+        <>
+          Pricing the basket against <b className="text-ink font-medium">USDA</b> and searching local distributors in parallel.
+        </>
+      ),
+    };
+  }
   if (allDone) {
     return {
       live: false,
@@ -80,7 +106,34 @@ function pattyLine(runningKey: StageKey | null, allDone: boolean): {
       ),
     };
   }
-  if (!runningKey) return { live: true, text: "Starting up…" };
+  if (!runningKey) {
+    // No stage is "running" but the pipeline isn't done. Two cases:
+    //   (a) Cold start: every stage is pending. Patty is queuing parse_menu.
+    //   (b) Handoff: a prior stage finished, next stage is queued but the
+    //       runner hasn't picked it up yet. Name the next stage.
+    const nextIdx = phases.findIndex((p) => p === "pending");
+    if (nextIdx === -1) return { live: true, text: "Picking up where we left off." };
+    const nextKey = STAGE_KEYS[nextIdx];
+    const allPending = phases.every((p) => p === "pending");
+    if (allPending) {
+      return {
+        live: true,
+        text: (
+          <>
+            Spinning up the pipeline. First stop: <b className="text-ink font-medium">{STAGE_TITLES[nextKey]}</b>.
+          </>
+        ),
+      };
+    }
+    return {
+      live: true,
+      text: (
+        <>
+          Handing off to <b className="text-ink font-medium">{STAGE_TITLES[nextKey]}</b>. Queueing the next pass.
+        </>
+      ),
+    };
+  }
   const map: Record<StageKey, React.ReactNode> = {
     parse_menu: <>Reading the menu. Extracting dishes into an ingredient basket.</>,
     fetch_pricing: <>Pricing the basket against <b className="text-ink font-medium">USDA</b> market data.</>,
@@ -131,7 +184,20 @@ export function LivePipeline({ runId }: { runId: Id<"pipelineRuns"> }) {
   const completed = phases.filter((p) => p === "done").length;
   const allDone = completed === STAGE_KEYS.length;
   const runningKey = runningIdx >= 0 ? STAGE_KEYS[runningIdx] : null;
-  const narration = pattyLine(runningKey, allDone);
+
+  // When the agent is in stage 5, the topbar ticker surfaces the most recent
+  // agentEvents summary so the user sees what Patty just did, not a static line.
+  const latestEvents = useQuery(
+    api.agent.getRecentEventsForRun,
+    runningKey === "collect_quotes" ? { runId, limit: 1 } : "skip",
+  );
+  const liveEventSummary =
+    runningKey === "collect_quotes" && latestEvents && latestEvents.length > 0
+      ? latestEvents[0].summary
+      : null;
+  const narration = liveEventSummary
+    ? { live: true, text: liveEventSummary as React.ReactNode }
+    : pattyLine(runningKey, allDone, phases);
   const pct = Math.min(
     100,
     ((completed + (runningIdx >= 0 ? 0.5 : 0)) / STAGE_KEYS.length) * 100,
@@ -214,18 +280,22 @@ function StageNode({
   active,
   onClick,
   summary,
+  isNext,
 }: {
   i: number;
   phase: StageStatus;
   active: boolean;
   onClick: () => void;
   summary?: string;
+  isNext?: boolean;
 }) {
   const meta = STAGE_META[i];
   const Ic = STAGE_ICONS[i];
   const chip =
     phase === "pending"
-      ? "bg-st-pending-bg text-st-pending"
+      ? isNext
+        ? "bg-mint text-forest"
+        : "bg-st-pending-bg text-st-pending"
       : phase === "running"
         ? "bg-st-running-bg text-st-running"
         : phase === "error"
@@ -239,7 +309,9 @@ function StageNode({
         ? meta.run
         : phase === "error"
           ? "Stage failed"
-          : "Waiting";
+          : isNext
+            ? "Up next, queued"
+            : "Waiting";
 
   return (
     <button
@@ -290,6 +362,11 @@ function VerticalRail({
   pick: (i: number) => void;
   summaries: Array<string | undefined>;
 }) {
+  // The "next" stage is the first pending one when no stage is currently
+  // running. Surface it visually so the user sees what's queued instead of
+  // a row of indistinguishable "Waiting" rows.
+  const anyRunning = phases.some((p) => p === "running");
+  const nextIdx = anyRunning ? -1 : phases.findIndex((p) => p === "pending");
   return (
     <div className="flex flex-col">
       {STAGE_META.map((s, i) => (
@@ -300,6 +377,7 @@ function VerticalRail({
             active={i === selIdx}
             onClick={() => phases[i] !== "pending" && pick(i)}
             summary={summaries[i]}
+            isNext={i === nextIdx}
           />
           {i < STAGE_META.length - 1 && (
             <span className="w-[2px] h-[18px] ml-[27px] bg-border-strong relative overflow-hidden rounded-full">

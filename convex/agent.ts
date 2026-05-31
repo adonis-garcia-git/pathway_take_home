@@ -19,7 +19,13 @@
 // demos (e.g. NUDGE_DELAY_MS = 30s if you want to see the cron fire live).
 
 import { v } from "convex/values";
-import { internalAction, internalMutation, internalQuery } from "./_generated/server";
+import {
+  internalAction,
+  internalMutation,
+  internalQuery,
+  mutation,
+  query,
+} from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
@@ -38,15 +44,201 @@ import {
   type QuoteInput,
 } from "./lib/recommendation";
 import { writeRecommendationRationale } from "./lib/anthropic";
+import {
+  NUDGE_DELAY_MS,
+  MAX_ATTEMPTS,
+  BATCH_LIMIT,
+} from "./lib/agentConstants";
 
-// ── Constants ──────────────────────────────────────────────────────
+// ── Event log helpers ──────────────────────────────────────────────
 
-const NUDGE_DELAY_MS = 30 * 60 * 1000; // 30 minutes after initial send
-const MAX_ATTEMPTS = 3;                // initial + at most 2 follow-ups
-const BATCH_LIMIT = 10;                // per-tick cap per pass
+const kindValidator = v.union(
+  v.literal("tick_scan"),
+  v.literal("follow_up_sent"),
+  v.literal("nudge_sent"),
+  v.literal("quote_received"),
+  v.literal("quote_parsed"),
+  v.literal("recommendation_written"),
+  v.literal("scheduled"),
+  v.literal("send_failed"),
+);
+
+export const appendAgentEvent = internalMutation({
+  args: {
+    runId: v.id("pipelineRuns"),
+    kind: kindValidator,
+    summary: v.string(),
+    recipientId: v.optional(v.id("rfpRecipients")),
+    distributorName: v.optional(v.string()),
+    nextTickAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("agentEvents", { ...args, at: Date.now() });
+  },
+});
+
+export const getRecentEventsForRun = query({
+  args: { runId: v.id("pipelineRuns"), limit: v.optional(v.number()) },
+  handler: async (ctx, { runId, limit = 50 }) => {
+    return await ctx.db
+      .query("agentEvents")
+      .withIndex("by_runId_and_at", (q) => q.eq("runId", runId))
+      .order("desc")
+      .take(limit);
+  },
+});
+
+/** Surfaces the RFP deadline for the countdown chip in stage 5. */
+export const getRunDeadline = query({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }): Promise<number | null> => {
+    const run = await ctx.db.get(runId);
+    if (!run?.rfpId) return null;
+    const rfp = await ctx.db.get(run.rfpId);
+    return rfp?.deadline ?? null;
+  },
+});
+
+function fmtRel(ms: number): string {
+  if (ms < 1000) return "moments";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m < 60) return r === 0 ? `${m}m` : `${m}m ${r}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+/**
+ * Optional helper for a future event-driven scheduler. Computes when the
+ * next agent action becomes eligible across all runs and schedules a
+ * single one-shot tick at that moment, deduping via the agentSchedule
+ * singleton. Not wired into the shipping agent (which runs from cron);
+ * kept here so the pattern is available when needed.
+ */
+export const scheduleNextTick = internalMutation({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const now = Date.now();
+    let earliest = Number.POSITIVE_INFINITY;
+
+    // (a) Quote with missingInfo=true and no follow-up yet → eligible NOW.
+    const allQuotes = await ctx.db.query("quotes").collect();
+    if (
+      allQuotes.some(
+        (q) => q.missingInfo && q.missingInfoFollowUpSentAt === undefined,
+      )
+    ) {
+      earliest = now;
+    }
+
+    // (b) Recipient still "sent" past sentAt + NUDGE_DELAY_MS, under attempts cap.
+    if (earliest > now) {
+      const recipients = await ctx.db.query("rfpRecipients").collect();
+      for (const r of recipients) {
+        if (r.emailStatus !== "sent") continue;
+        if (r.attempts >= MAX_ATTEMPTS) continue;
+        if (!r.sentAt) continue;
+        const eligible = r.sentAt + NUDGE_DELAY_MS;
+        if (eligible < earliest) earliest = eligible;
+      }
+    }
+
+    if (!Number.isFinite(earliest)) return;
+    const targetAt = Math.max(now, earliest);
+
+    // Singleton dedup. If a tick is already scheduled at or before the new
+    // target, our work is redundant. Mutations are serializable, so
+    // concurrent callers all read the latest singleton state.
+    const singleton = await ctx.db.query("agentSchedule").first();
+    if (
+      singleton?.nextRunAt !== undefined &&
+      singleton.nextRunAt > now &&
+      singleton.nextRunAt <= targetAt
+    ) {
+      return;
+    }
+
+    const delay = targetAt - now;
+    await ctx.scheduler.runAfter(delay, internal.agent.tick, {});
+    if (singleton) {
+      await ctx.db.patch(singleton._id, { nextRunAt: targetAt });
+    } else {
+      await ctx.db.insert("agentSchedule", { nextRunAt: targetAt });
+    }
+    await ctx.db.insert("agentEvents", {
+      runId,
+      at: now,
+      kind: "scheduled",
+      summary:
+        delay === 0
+          ? "Scheduled an immediate pass."
+          : `Next pass in ${fmtRel(delay)}.`,
+      nextTickAt: targetAt,
+    });
+  },
+});
+
+/** Called at tick entry to clear the singleton so the next round can rearm. */
+export const clearScheduledTick = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const singleton = await ctx.db.query("agentSchedule").first();
+    if (singleton) await ctx.db.patch(singleton._id, { nextRunAt: undefined });
+  },
+});
+
+/**
+ * Cancel every pending scheduled function in batches. Useful from the
+ * Convex dashboard if the scheduler queue ever needs to be cleared.
+ * Returns the count cancelled. Safe to call multiple times.
+ */
+export const cancelAllScheduledFunctions = mutation({
+  args: { batchSize: v.optional(v.number()) },
+  handler: async (ctx, { batchSize }) => {
+    // Convex caps a single mutation at 4096 reads. The system table has no
+    // user-defined index on state.kind, so .filter() forces a full scan and
+    // every scanned row counts as a read. We can't filter safely.
+    //
+    // Strategy: take a bounded batch of raw rows, filter in memory, cancel
+    // up to a strict budget. Each scheduler.cancel() costs a small number
+    // of internal reads, so the take-size + cancel-budget * cost-per-cancel
+    // must stay well under 4096. Conservative defaults: take 600, cancel up
+    // to 300. Worst case ~600 + 300*5 = 2100 reads, well under the limit.
+    //
+    // Returns `{ scanned, cancelled, more }`. Run repeatedly from the
+    // dashboard until `more === false`.
+    const limit = Math.max(1, Math.min(batchSize ?? 600, 800));
+    const CANCEL_BUDGET = 300;
+    const batch = await ctx.db.system.query("_scheduled_functions").take(limit);
+    let cancelled = 0;
+    for (const job of batch) {
+      if (cancelled >= CANCEL_BUDGET) break;
+      const kind = (job as { state?: { kind?: string } }).state?.kind;
+      if (kind !== "pending" && kind !== "inProgress") continue;
+      try {
+        await ctx.scheduler.cancel(job._id);
+        cancelled++;
+      } catch {
+        // Already-finalized rows can race; ignore and move on.
+      }
+    }
+    const singleton = await ctx.db.query("agentSchedule").first();
+    if (singleton) await ctx.db.patch(singleton._id, { nextRunAt: undefined });
+    return {
+      scanned: batch.length,
+      cancelled,
+      more: batch.length === limit,
+    };
+  },
+});
 
 // ── tick: the cron entrypoint ──────────────────────────────────────
 
+// Fires every 5 minutes via the heartbeat in crons.ts. Two idempotent
+// passes: send follow-ups to quotes flagged missing-info, then nudge
+// recipients who haven't replied within NUDGE_DELAY_MS.
 export const tick = internalAction({
   args: {},
   handler: async (ctx) => {
@@ -75,6 +267,30 @@ export const tick = internalAction({
         console.error(`[agent.tick] no-reply nudge failed for recipient ${r._id}:`, e);
       }
     }
+  },
+});
+
+export const runIdForRfp = internalQuery({
+  args: { rfpId: v.id("rfps") },
+  handler: async (ctx, { rfpId }): Promise<Id<"pipelineRuns"> | null> => {
+    const run = await ctx.db
+      .query("pipelineRuns")
+      .withIndex("by_rfpId", (q) => q.eq("rfpId", rfpId))
+      .first();
+    return run?._id ?? null;
+  },
+});
+
+export const findActiveCollectQuotesRuns = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<Id<"pipelineRuns">[]> => {
+    const runs = await ctx.db.query("pipelineRuns").collect();
+    const active: Id<"pipelineRuns">[] = [];
+    for (const r of runs) {
+      const step = r.steps.find((s) => s.step === "collect_quotes");
+      if (step?.status === "running") active.push(r._id);
+    }
+    return active;
   },
 });
 
@@ -186,24 +402,25 @@ export const markQuoteSkipped = internalMutation({
 
 export const sendMissingInfoFollowUp = internalAction({
   args: { quoteId: v.id("quotes") },
-  handler: async (ctx, { quoteId }) => {
+  handler: async (ctx, { quoteId }): Promise<Id<"pipelineRuns"> | null> => {
     const context = await ctx.runQuery(internal.agent.getMissingInfoContext, { quoteId });
     if (!context) {
-      // Orphan quote (recipient or rfp gone — leftover from earlier dev runs).
-      // Mark it so it falls out of the cron scan and stops blocking progress.
       await ctx.runMutation(internal.agent.markQuoteSkipped, { quoteId });
-      return;
+      return null;
     }
     const { quote, recipient, rfp, restaurant, distributor, missingLines } = context;
-    if (recipient.attempts >= MAX_ATTEMPTS) return;
-    if (recipient.emailStatus === "failed") return;
+    const runId = await ctx.runQuery(internal.agent.runIdForRfp, { rfpId: rfp._id });
+    if (recipient.attempts >= MAX_ATTEMPTS) return runId;
+    if (recipient.emailStatus === "failed") return runId;
+    // attempts: 1 = initial RFP, 2 = first follow-up, 3 = second (final).
+    const round: 1 | 2 = recipient.attempts >= 2 ? 2 : 1;
     if (missingLines.length === 0) {
       // Nothing actually missing — mark to skip future ticks.
       await ctx.runMutation(internal.agent.markMissingInfoFollowedUp, {
         quoteId,
         rfpRecipientId: recipient._id,
       });
-      return;
+      return runId;
     }
 
     const apiKey = optional("MAILEROO_SENDING_KEY");
@@ -216,7 +433,17 @@ export const sendMissingInfoFollowUp = internalAction({
         rfpRecipientId: recipient._id,
         sentMessageId: `mock:${Math.random().toString(36).slice(2, 10)}`,
       });
-      return;
+      if (runId) {
+        const roundTag = round === 2 ? " (round 2)" : "";
+        await ctx.runMutation(internal.agent.appendAgentEvent, {
+          runId,
+          kind: "follow_up_sent",
+          summary: `Asked ${distributor.name} about ${missingLines.length} missing line${missingLines.length === 1 ? "" : "s"}${roundTag}.`,
+          recipientId: recipient._id,
+          distributorName: distributor.name,
+        });
+      }
+      return runId;
     }
 
     const replyAddress = replyAddressFor(distributor._id as unknown as string, mailDomain);
@@ -241,7 +468,7 @@ export const sendMissingInfoFollowUp = internalAction({
       apiKey,
       from: `Patty (${restaurant.name}) <rfp@${mailDomain}>`,
       to,
-      subject: buildMissingInfoSubject(restaurant.name),
+      subject: buildMissingInfoSubject(restaurant.name, round),
       html,
       replyTo: replyAddress,
     });
@@ -249,7 +476,26 @@ export const sendMissingInfoFollowUp = internalAction({
     void quote; // keep destructured ref so signatures stay stable
     if (!result.ok) {
       console.warn(`[agent] missing-info send failed (marker already set to prevent double-send): ${result.error}`);
+      if (runId) {
+        await ctx.runMutation(internal.agent.appendAgentEvent, {
+          runId,
+          kind: "send_failed",
+          summary: `Tried to follow up with ${distributor.name} but Maileroo rejected the send.`,
+          recipientId: recipient._id,
+          distributorName: distributor.name,
+        });
+      }
+    } else if (runId) {
+      const roundTag = round === 2 ? " (round 2)" : "";
+      await ctx.runMutation(internal.agent.appendAgentEvent, {
+        runId,
+        kind: "follow_up_sent",
+        summary: `Asked ${distributor.name} about ${missingLines.length} missing line${missingLines.length === 1 ? "" : "s"}${roundTag}.`,
+        recipientId: recipient._id,
+        distributorName: distributor.name,
+      });
     }
+    return runId;
   },
 });
 
@@ -296,12 +542,16 @@ export const markRecipientFollowedUp = internalMutation({
 
 export const sendNoReplyNudge = internalAction({
   args: { rfpRecipientId: v.id("rfpRecipients") },
-  handler: async (ctx, { rfpRecipientId }) => {
+  handler: async (ctx, { rfpRecipientId }): Promise<Id<"pipelineRuns"> | null> => {
     const context = await ctx.runQuery(internal.agent.getNudgeContext, { rfpRecipientId });
-    if (!context) return;
+    if (!context) return null;
     const { recipient, rfp, restaurant, distributor } = context;
-    if (recipient.emailStatus !== "sent") return;
-    if (recipient.attempts >= MAX_ATTEMPTS) return;
+    const runId = await ctx.runQuery(internal.agent.runIdForRfp, { rfpId: rfp._id });
+    if (recipient.emailStatus !== "sent") return runId;
+    if (recipient.attempts >= MAX_ATTEMPTS) return runId;
+
+    const silenceMs = recipient.sentAt ? Date.now() - recipient.sentAt : 0;
+    const silenceLabel = silenceMs > 0 ? fmtRel(silenceMs) : "a while";
 
     const apiKey = optional("MAILEROO_SENDING_KEY");
     const mailDomain = optional("MAIL_DOMAIN");
@@ -311,7 +561,16 @@ export const sendNoReplyNudge = internalAction({
         rfpRecipientId: recipient._id,
         sentMessageId: `mock:${Math.random().toString(36).slice(2, 10)}`,
       });
-      return;
+      if (runId) {
+        await ctx.runMutation(internal.agent.appendAgentEvent, {
+          runId,
+          kind: "nudge_sent",
+          summary: `Nudged ${distributor.name} after ${silenceLabel} of silence.`,
+          recipientId: recipient._id,
+          distributorName: distributor.name,
+        });
+      }
+      return runId;
     }
 
     const replyAddress = replyAddressFor(distributor._id as unknown as string, mailDomain);
@@ -333,12 +592,31 @@ export const sendNoReplyNudge = internalAction({
 
     if (!result.ok) {
       console.warn(`[agent] nudge send failed: ${result.error}`);
-      return;
+      if (runId) {
+        await ctx.runMutation(internal.agent.appendAgentEvent, {
+          runId,
+          kind: "send_failed",
+          summary: `Tried to nudge ${distributor.name} but Maileroo rejected the send.`,
+          recipientId: recipient._id,
+          distributorName: distributor.name,
+        });
+      }
+      return runId;
     }
     await ctx.runMutation(internal.agent.markRecipientFollowedUp, {
       rfpRecipientId: recipient._id,
       sentMessageId: result.messageId,
     });
+    if (runId) {
+      await ctx.runMutation(internal.agent.appendAgentEvent, {
+        runId,
+        kind: "nudge_sent",
+        summary: `Nudged ${distributor.name} after ${silenceLabel} of silence.`,
+        recipientId: recipient._id,
+        distributorName: distributor.name,
+      });
+    }
+    return runId;
   },
 });
 
@@ -534,32 +812,55 @@ export const generateRecommendation = internalAction({
       weeklyValue: s.weeklyValue,
     }));
 
-    await ctx.runMutation(internal.agent.upsertForRun, {
-      runId,
-      rfpId: rfp._id,
-      primaryDistributorId: draft.primary
-        ? (draft.primary.distributorId as unknown as Id<"distributors">)
-        : undefined,
-      splits: splitsForWrite,
-      gaps: draft.gaps,
-      confidence: draft.confidence,
-      needsHumanApproval: draft.needsHumanApproval,
-      headline: rationale.headline,
-      rationale: rationale.rationale,
-      estSavings: draft.estSavings,
-      estBaseline: draft.estBaseline,
-      scoreSummary: {
-        scored: draft.scored.map((s) => ({
-          distributorId: s.distributorId,
-          distributorName: s.distributorName,
-          totalScore: s.totalScore,
-          priceScore: s.priceScore,
-          completenessScore: s.completenessScore,
-          termsScore: s.termsScore,
-          totalPrice: s.totalPrice,
-        })),
-        margin: draft.margin,
-      },
-    });
+    // Several inbound replies arriving in the same second each schedule a
+    // generateRecommendation 5s later, so we can get many concurrent writers
+    // contending on the same recommendations row. Each writer produces the
+    // same result from the same inputs, so it's safe to swallow OCC failures:
+    // whichever writer wins is the recommendation we keep.
+    try {
+      await ctx.runMutation(internal.agent.upsertForRun, {
+        runId,
+        rfpId: rfp._id,
+        primaryDistributorId: draft.primary
+          ? (draft.primary.distributorId as unknown as Id<"distributors">)
+          : undefined,
+        splits: splitsForWrite,
+        gaps: draft.gaps,
+        confidence: draft.confidence,
+        needsHumanApproval: draft.needsHumanApproval,
+        headline: rationale.headline,
+        rationale: rationale.rationale,
+        estSavings: draft.estSavings,
+        estBaseline: draft.estBaseline,
+        scoreSummary: {
+          scored: draft.scored.map((s) => ({
+            distributorId: s.distributorId,
+            distributorName: s.distributorName,
+            totalScore: s.totalScore,
+            priceScore: s.priceScore,
+            completenessScore: s.completenessScore,
+            termsScore: s.termsScore,
+            totalPrice: s.totalPrice,
+          })),
+          margin: draft.margin,
+        },
+      });
+      await ctx.runMutation(internal.agent.appendAgentEvent, {
+        runId,
+        kind: "recommendation_written",
+        summary: rationale.headline
+          ? `Wrote a fresh recommendation: ${rationale.headline}`
+          : "Wrote a fresh recommendation.",
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("changed while this mutation was being run")) {
+        // OCC conflict from concurrent recommendation generators. Another
+        // writer already produced the same recommendation; nothing to do.
+        console.log(`[generateRecommendation] OCC swallowed for ${runId}`);
+      } else {
+        throw e;
+      }
+    }
   },
 });

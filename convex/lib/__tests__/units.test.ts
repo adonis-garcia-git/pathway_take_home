@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalize, sumCompatible, sumOccurrences, formatQty } from "../units";
+import { normalize, sumCompatible, sumOccurrences, formatQty, normalizePackUnit } from "../units";
 
 describe("normalize", () => {
   it("converts 8 oz to 0.5 lb", () => {
@@ -101,6 +101,57 @@ describe("sumOccurrences", () => {
   it("handles empty array safely", () => {
     const r = sumOccurrences([]);
     expect(r.qty).toBe(0);
+  });
+});
+
+describe("normalizePackUnit", () => {
+  it("resolves cwt to 100 lb", () => {
+    const r = normalizePackUnit("cwt");
+    expect(r).toEqual({ ok: true, baseQtyPerPack: 100, base: "lb", dim: "mass" });
+  });
+
+  it("converts a $45/cwt price to $0.45/lb via baseQtyPerPack", () => {
+    const r = normalizePackUnit("cwt");
+    expect("ok" in r && r.ok).toBe(true);
+    if ("ok" in r) expect(45 / r.baseQtyPerPack).toBeCloseTo(0.45);
+  });
+
+  it("resolves a named 25 lb carton to 25 lb", () => {
+    const r = normalizePackUnit("25 lb carton");
+    expect(r).toEqual({ ok: true, baseQtyPerPack: 25, base: "lb", dim: "mass" });
+  });
+
+  it("passes plain lb through with factor 1", () => {
+    const r = normalizePackUnit("lb");
+    expect(r).toEqual({ ok: true, baseQtyPerPack: 1, base: "lb", dim: "mass" });
+  });
+
+  it("converts $3.20 per oz to $51.20 per lb", () => {
+    const r = normalizePackUnit("oz");
+    if (!("ok" in r)) throw new Error("expected ok");
+    expect(3.2 / r.baseQtyPerPack).toBeCloseTo(51.2);
+  });
+
+  it("resolves dozen to 12 each (count)", () => {
+    const r = normalizePackUnit("dozen");
+    expect(r).toEqual({ ok: true, baseQtyPerPack: 12, base: "each", dim: "count" });
+  });
+
+  it("flags a bare carton as opaque", () => {
+    const r = normalizePackUnit("carton");
+    expect("opaque" in r && r.opaque).toBe(true);
+    if ("opaque" in r) expect(r.reason).toMatch(/carton/i);
+  });
+
+  it("flags a bare case as opaque", () => {
+    const r = normalizePackUnit("case");
+    expect("opaque" in r && r.opaque).toBe(true);
+  });
+
+  it("flags an unrecognized unit as opaque with the raw input", () => {
+    const r = normalizePackUnit("zorbflake");
+    expect("opaque" in r && r.opaque).toBe(true);
+    if ("opaque" in r) expect(r.reason).toContain("zorbflake");
   });
 });
 

@@ -16,6 +16,7 @@ const dish = (dishIndex: number, ingredients: ParsedDish["ingredients"]): Parsed
   name: `dish-${dishIndex}`,
   confidence: "high",
   needsReview: false,
+  estimatedServingsPerWeek: 50,
   ingredients,
 });
 
@@ -126,5 +127,30 @@ describe("aggregateIngredients — roll-up", () => {
     const names = result.map((r) => r.canonicalName).sort();
     // mozzarella → mozzarella cheese via synonym
     expect(names).toEqual(["basil", "mozzarella cheese", "tomato"]);
+  });
+});
+
+describe("aggregateIngredients — servings-per-week multiplier", () => {
+  it("scales per-serving quantities by the dish's servings-per-week", () => {
+    const dishes = [
+      dish(0, [ing({ canonicalName: "tomato", unit: "lb", estimatedQuantity: 0.5, category: "produce" })]),
+      dish(1, [ing({ canonicalName: "tomato", unit: "lb", estimatedQuantity: 0.2, category: "produce" })]),
+    ];
+    const multipliers = new Map<number, number>([
+      [0, 100], // 100 servings/wk → 50 lb
+      [1, 50], // 50 servings/wk → 10 lb
+    ]);
+    const result = aggregateIngredients(dishes, multipliers);
+    expect(result).toHaveLength(1);
+    const totalQty = result[0].occurrences.reduce((a, o) => a + o.estimatedQuantity, 0);
+    expect(totalQty).toBeCloseTo(60, 1);
+  });
+
+  it("defaults missing entries to 1x (no scaling)", () => {
+    const result = aggregateIngredients(
+      [dish(0, [ing({ canonicalName: "basil", unit: "lb", estimatedQuantity: 0.1, category: "produce" })])],
+      new Map(),
+    );
+    expect(result[0].occurrences[0].estimatedQuantity).toBeCloseTo(0.1);
   });
 });

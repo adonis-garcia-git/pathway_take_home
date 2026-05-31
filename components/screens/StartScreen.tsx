@@ -4,7 +4,7 @@ import React, { useRef, useState } from "react";
 import {
   Link2, AlignLeft, Upload, MapPin, Play, FileText, Sprout, Tag, Send, Award, Store, Loader2, X,
 } from "lucide-react";
-import { useMutation } from "convex/react";
+import { useAction, useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import {
@@ -41,7 +41,7 @@ export function StartScreen({ onRun }: { onRun: (runId: Id<"pipelineRuns">) => v
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const createFromMenu = useMutation(api.menus.createFromMenu);
+  const createFromMenu = useAction(api.menus.createFromMenu);
   const generateUploadUrl = useMutation(api.menus.generateUploadUrl);
   const startPipeline = useMutation(api.pipelineRuns.startPipeline);
 

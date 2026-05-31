@@ -53,8 +53,18 @@ export const markStepRunning = internalMutation({
   handler: async (ctx, { runId, step }) => {
     const run = await ctx.db.get(runId);
     if (!run) return;
+    const now = Date.now();
     const steps = run.steps.map((s) =>
-      s.step === step ? { ...s, status: "running" as const, startedAt: Date.now() } : s,
+      s.step === step
+        ? {
+            ...s,
+            status: "running" as const,
+            // Preserve a pre-mark startedAt set by scheduleNext so elapsed
+            // time stays anchored to when we committed to starting, not when
+            // the cold-started runner happened to land.
+            startedAt: s.startedAt ?? now,
+          }
+        : s,
     );
     await ctx.db.patch(runId, { steps, currentStep: step });
   },

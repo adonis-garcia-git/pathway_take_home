@@ -166,17 +166,31 @@ function dominantUnit(occurrences: IngredientOccurrence[]): string {
 }
 
 // ── public API ──────────────────────────────────────────────────────
-export function aggregateIngredients(dishes: ParsedDish[]): AggregatedIngredient[] {
+/**
+ * Cluster and roll up ingredient occurrences across dishes.
+ *
+ * If `servingsPerWeekByIndex` is provided, each occurrence's per-serving
+ * `estimatedQuantity` is multiplied by the owning dish's servings-per-week
+ * BEFORE aggregation, so the final occurrences carry weekly per-dish
+ * contributions rather than per-plate quantities. When the map is omitted
+ * or has no entry for a dish, that dish's quantities pass through unscaled
+ * (default 1, equivalent to "one serving").
+ */
+export function aggregateIngredients(
+  dishes: ParsedDish[],
+  servingsPerWeekByIndex?: ReadonlyMap<number, number>,
+): AggregatedIngredient[] {
   // Step 1+2: normalize + synonym for every occurrence.
   type Occ = IngredientOccurrence & { norm: string; category: Category };
   const occs: Occ[] = [];
   for (const dish of dishes) {
+    const multiplier = servingsPerWeekByIndex?.get(dish.dishIndex) ?? 1;
     for (const ing of dish.ingredients) {
       const norm = applySynonym(normalize(ing.canonicalName));
       occs.push({
         dishIndex: dish.dishIndex,
         rawName: ing.rawName,
-        estimatedQuantity: ing.estimatedQuantity,
+        estimatedQuantity: Math.round(ing.estimatedQuantity * multiplier * 100) / 100,
         unit: ing.unit.toLowerCase().trim(),
         confidence: ing.confidence,
         assumptionNote: ing.assumptionNote,

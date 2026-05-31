@@ -20,7 +20,7 @@ export const runSendRfps = internalAction({
         step,
         summary: result.summary,
       });
-      await ctx.runAction(internal.pipeline.index.scheduleNext, { runId, justFinished: step });
+      await ctx.runMutation(internal.pipeline.index.scheduleNext, { runId, justFinished: step });
     } catch (e) {
       await ctx.runMutation(internal.pipelineRuns.markStepError, {
         runId,

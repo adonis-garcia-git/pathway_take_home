@@ -65,6 +65,14 @@ export const DishExtractionSchema = z.object({
     .describe(
       "True if this dish needs a human eye: vague description, ambiguous cut/grade, house special with no recipe hints, dietary-restriction substitutions implied. Be generous: false positives are cheaper than missed reviews.",
     ),
+  estimatedServingsPerWeek: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Your best guess at how many servings of this dish a small to medium restaurant sells in a week. Use experienced-chef judgment based on dish type and menu position. Reasonable defaults: high-volume appetizer or pizza around 150, entree around 80, special or composed plate around 40, dessert around 60. Omit only when you truly cannot guess; the system will default to 50 in that case.",
+    ),
   ingredients: z
     .array(IngredientExtractionSchema)
     .describe(

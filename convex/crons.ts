@@ -3,9 +3,8 @@ import { internal } from "./_generated/api";
 
 const crons = cronJobs();
 
-// Autonomous agent loop: every 2 minutes, run the missing-info and no-reply
-// scan passes. Both passes are idempotent and self-capped (see agent.ts), so
-// it's safe to make the interval shorter for live demos.
-crons.interval("agent-tick", { minutes: 2 }, internal.agent.tick, {});
+// Cron-driven agent loop. Heartbeat every 5 minutes scans for missing-info
+// follow-ups and no-reply nudges across all active runs.
+crons.interval("agent-heartbeat", { minutes: 5 }, internal.agent.tick, {});
 
 export default crons;

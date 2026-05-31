@@ -27,19 +27,25 @@ export const runFindDistributors = internalAction({
     try {
       await ctx.runMutation(internal.pipelineRuns.markStepRunning, { runId, step });
 
-      // 1. Always seed mocks first so the demo has a baseline distributor pool
-      //    even when GOOGLE_PLACES_API_KEY is unset. seedDistributors is
-      //    idempotent (keyed on `externalId = "mock:<slug>"`).
-      const seedResult = await ctx.runMutation(internal.distributors.seedDistributors, {});
-
-      // 2. Discover from Google Places, biased to the restaurant's location.
-      //    discoverFromPlaces is a no-op (returns zeros) if the API key is
-      //    missing — we still complete the stage successfully.
+      // Discover from Google Places, biased to the restaurant's location.
+      // No mock seeding: Places is the sole discovery source. Each
+      // candidate's website is scraped for a mailto email so Stage 4 has
+      // a real `to:` address to send to (or to redirect to a demo inbox).
       const where = await ctx.runQuery(internal.pipeline.findDistributors.getRunRestaurant, {
         runId,
       });
 
-      let placesResult = { distinctPlaces: 0, newDistributors: 0, existingDistributors: 0 };
+      let placesResult: {
+        distinctPlaces: number;
+        newDistributors: number;
+        existingDistributors: number;
+        widenedCategories?: number;
+        emailsScraped?: number;
+      } = {
+        distinctPlaces: 0,
+        newDistributors: 0,
+        existingDistributors: 0,
+      };
       if (where) {
         placesResult = await ctx.runAction(internal.distributors.discoverFromPlaces, {
           address: where.address,
@@ -48,12 +54,21 @@ export const runFindDistributors = internalAction({
         });
       }
 
-      const placesCount = placesResult.newDistributors + placesResult.existingDistributors;
-      const totalCatalog = seedResult.mocksInCatalog + placesResult.newDistributors;
-      const summary = `${totalCatalog} distributors · ${placesCount} from Places, ${seedResult.mocksInCatalog} mock`;
+      const newThisRun = placesResult.newDistributors;
+      const existingFromPrior = placesResult.existingDistributors;
+      const totalForRun = newThisRun + existingFromPrior;
+      const emailsScraped = placesResult.emailsScraped ?? 0;
+      const parts = [
+        `${totalForRun} distributors discovered`,
+        `${newThisRun} new this run, ${existingFromPrior} from prior discovery`,
+      ];
+      if (emailsScraped > 0) {
+        parts.push(`${emailsScraped} email${emailsScraped === 1 ? "" : "s"} scraped`);
+      }
+      const summary = parts.join(" · ");
 
       await ctx.runMutation(internal.pipelineRuns.markStepDone, { runId, step, summary });
-      await ctx.runAction(internal.pipeline.index.scheduleNext, { runId, justFinished: step });
+      await ctx.runMutation(internal.pipeline.index.scheduleNext, { runId, justFinished: step });
     } catch (e) {
       await ctx.runMutation(internal.pipelineRuns.markStepError, {
         runId,

@@ -113,8 +113,9 @@ export function buildMissingInfoHtml(input: MissingInfoTemplateInput): string {
 </body></html>`;
 }
 
-export function buildMissingInfoSubject(restaurantName: string): string {
-  return `Re: RFP: a few missing prices for ${restaurantName}`;
+export function buildMissingInfoSubject(restaurantName: string, round: 1 | 2 = 1): string {
+  const prefix = round === 2 ? "Re: RFP follow-up #2" : "Re: RFP";
+  return `${prefix}: a few missing prices for ${restaurantName}`;
 }
 
 export interface NudgeTemplateInput {

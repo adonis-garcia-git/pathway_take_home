@@ -70,6 +70,102 @@ const TABLE: Record<string, UnitMeta> = {
 const canon = (u: string): string =>
   u.trim().toLowerCase().replace(/\./g, "").replace(/\s+/g, " ");
 
+// ── USDA retail-pack normalization ─────────────────────────────────
+//
+// USDA MARS reports quote prices in pack units that vary by commodity
+// and report. We convert the common, unambiguous packs to per-base-unit
+// (per-lb for mass, per-each for count). Packs we cannot disambiguate
+// without commodity-specific info (a bare "carton" or "case") are flagged
+// opaque, and callers must skip pricing math on those rows.
+
+type OpaquePack = { opaque: true; reason: string };
+
+const RETAIL_PACK_TABLE: Record<string, UnitMeta | OpaquePack> = {
+  // mass packs
+  cwt: { factor: 100, dim: "mass", base: MASS_BASE },
+  "hundred weight": { factor: 100, dim: "mass", base: MASS_BASE },
+  "100 lb": { factor: 100, dim: "mass", base: MASS_BASE },
+  "100 lbs": { factor: 100, dim: "mass", base: MASS_BASE },
+  "50 lb": { factor: 50, dim: "mass", base: MASS_BASE },
+  "50 lb sack": { factor: 50, dim: "mass", base: MASS_BASE },
+  "50 lb bag": { factor: 50, dim: "mass", base: MASS_BASE },
+  "40 lb": { factor: 40, dim: "mass", base: MASS_BASE },
+  "40 lb carton": { factor: 40, dim: "mass", base: MASS_BASE },
+  "30 lb": { factor: 30, dim: "mass", base: MASS_BASE },
+  "30 lb carton": { factor: 30, dim: "mass", base: MASS_BASE },
+  "25 lb": { factor: 25, dim: "mass", base: MASS_BASE },
+  "25 lb carton": { factor: 25, dim: "mass", base: MASS_BASE },
+  "20 lb": { factor: 20, dim: "mass", base: MASS_BASE },
+  "20 lb carton": { factor: 20, dim: "mass", base: MASS_BASE },
+  "10 lb": { factor: 10, dim: "mass", base: MASS_BASE },
+  "10 lb carton": { factor: 10, dim: "mass", base: MASS_BASE },
+  "5 lb": { factor: 5, dim: "mass", base: MASS_BASE },
+  "5 lb bag": { factor: 5, dim: "mass", base: MASS_BASE },
+  // commodity-agnostic bushel approximation; varies in reality (apple 42 lb,
+  // tomato 53 lb, peach 50 lb). The generic 50 lb is good enough for round
+  // demo numbers; a commodity-aware table is out of scope.
+  bushel: { factor: 50, dim: "mass", base: MASS_BASE },
+  "1 1/9 bushel": { factor: 25, dim: "mass", base: MASS_BASE },
+  "5/9 bushel": { factor: 12, dim: "mass", base: MASS_BASE },
+
+  // count packs
+  "24 ct carton": { factor: 24, dim: "count", base: COUNT_BASE },
+  "24 count carton": { factor: 24, dim: "count", base: COUNT_BASE },
+  "18 ct carton": { factor: 18, dim: "count", base: COUNT_BASE },
+  "12 ct carton": { factor: 12, dim: "count", base: COUNT_BASE },
+  "30 ct flat": { factor: 30, dim: "count", base: COUNT_BASE },
+  flat: { factor: 30, dim: "count", base: COUNT_BASE }, // strawberry/berry flat ~ 12 pints; rough
+  crate: { factor: 24, dim: "count", base: COUNT_BASE },
+
+  // opaque packs: pack size depends on commodity and isn't stated
+  carton: { opaque: true, reason: "carton size not stated" },
+  ctn: { opaque: true, reason: "carton size not stated" },
+  cs: { opaque: true, reason: "case pack not stated" },
+  case: { opaque: true, reason: "case pack not stated" },
+  package: { opaque: true, reason: "package size not stated" },
+  pkg: { opaque: true, reason: "package size not stated" },
+  container: { opaque: true, reason: "container size not stated" },
+};
+
+export type PackNormalized =
+  | {
+      ok: true;
+      /** How many base units one pack equals. e.g. `cwt` → 100, `25 lb carton` → 25, `oz` → 1/16. */
+      baseQtyPerPack: number;
+      /** Base unit name: "lb" for mass, "each" for count, "gal" for volume. */
+      base: string;
+      dim: Exclude<Dimension, "unknown">;
+    }
+  | OpaquePack;
+
+/**
+ * Resolve a USDA-style pack unit to its base-unit equivalence. Returns
+ * `baseQtyPerPack` so callers can compute price-per-base-unit as
+ * `pricePerPack / baseQtyPerPack` (a $45/cwt price becomes $0.45/lb since
+ * 1 cwt = 100 lb).
+ *
+ * Falls back to the standard `TABLE` first (lb, oz, kg, dozen, etc.),
+ * then tries `RETAIL_PACK_TABLE`. Anything else is opaque and the caller
+ * must skip pricing math on that row.
+ */
+export function normalizePackUnit(unit: string): PackNormalized {
+  const u = canon(unit);
+  const compact = u.replace(/\s+/g, "");
+  // First try the standard table so common units like "lb" pass through
+  // with factor 1.
+  const meta = TABLE[u] ?? TABLE[compact];
+  if (meta) {
+    return { ok: true, baseQtyPerPack: meta.factor, base: meta.base, dim: meta.dim };
+  }
+  // Then try the retail pack table.
+  const pack = RETAIL_PACK_TABLE[u] ?? RETAIL_PACK_TABLE[compact];
+  if (pack) {
+    if ("opaque" in pack) return { opaque: true, reason: pack.reason };
+    return { ok: true, baseQtyPerPack: pack.factor, base: pack.base, dim: pack.dim };
+  }
+  return { opaque: true, reason: `unrecognized unit "${unit}"` };
+}
+
 export function normalize(qty: number, unit: string): Normalized {
   const u = canon(unit);
   const compact = u.replace(/\s+/g, ""); // try "fl oz" → "floz"

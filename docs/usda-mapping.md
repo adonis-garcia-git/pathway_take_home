@@ -21,6 +21,20 @@ curl -u "$USDA_MARS_API_KEY:" \
   | head -c 2000
 ```
 
+## Report slug verification
+
+Both routing slugs were confirmed against the public USDA My Market News
+report viewer:
+
+- `3324` resolves to `https://mymarketnews.ams.usda.gov/viewReport/3324`,
+  "National Retail Report Specialty Crops (FVWRETAIL)".
+- `2315` resolves to `https://mymarketnews.ams.usda.gov/viewReport/2315`,
+  "New York Terminal Market Vegetables Prices (NX_FV020)".
+
+To confirm slugs with your own key at any time, run the
+`marsProbe:probeMarsReports` action from the Convex dashboard. It hits
+`${MARS_BASE}/reports` with HTTP Basic auth and returns the catalog.
+
 ## Field-name casing verification
 
 **Status: NOT VERIFIED against a live response.** When this integration was
@@ -113,12 +127,34 @@ specific ingredient. Refine as real data comes in.
   `unmatched = false` (this is a system-level mock, not a per-row miss),
   `matchConfidence = 0`. Step summary explicitly says `(mock mode)`.
 
+## Pack unit normalization
+
+USDA quotes prices in pack units that vary by report (`cwt`, `25 lb carton`,
+`24 ct carton`, `bushel`, `each`, `dozen`). Before storage, the pack price
+is divided by the pack's base-unit equivalence so the stored `price` is
+per-lb (mass), per-each (count), or per-gal (volume). The original USDA
+unit is preserved on the row as `usdaUnit` so the UI tooltip can explain
+the conversion.
+
+Packs we cannot disambiguate without commodity-specific info (a bare
+`carton`, `case`, or `package`) are flagged `priceUnitIncomparable: true`.
+The UI shows `–` in the price column for those rows and excludes them from
+the weekly basket total. The recommendation engine asks distributors to
+quote them directly.
+
+The pack table lives in `convex/lib/units.ts` (`RETAIL_PACK_TABLE` plus the
+existing `TABLE`). Add entries as new MARS reports surface new packs.
+
 ## Trend
 
 `trend` on `ingredientPrices` is the signed percent change of
-`weighted_avg_price` between the two most recent report dates for the same
-commodity name. Two decimal places, signed. `null` when we don't have two
-report dates or either price is missing.
+`weighted_avg_price` between the latest report date and the most recent
+prior date that holds a matching commodity. Two decimal places, signed.
+Commodity matching across dates uses fuzzy similarity (≥ 0.85) so minor
+USDA label drift ("Roma Tomatoes" vs "Tomatoes Roma") still resolves. The
+date used as denominator is persisted as `trendPriorDate` and surfaced in
+the UI tooltip. `null` when no qualifying prior snapshot exists in the
+four most recent reports.
 
 ## Idempotency
 

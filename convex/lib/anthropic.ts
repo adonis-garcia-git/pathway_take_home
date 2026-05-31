@@ -74,7 +74,11 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
   opts: ForcedToolCallOptions<S>,
 ): Promise<z.infer<S>> {
   const apiKey = required("ANTHROPIC_API_KEY");
-  const client = new Anthropic({ apiKey });
+  // maxRetries: 0 disables the SDK's internal retry loop. We do our own
+  // bounded retry via withRetry; stacking both produces overlapping
+  // stream-close races (the Convex V8 isolate is strict about dangling
+  // stream lifecycles).
+  const client = new Anthropic({ apiKey, maxRetries: 0 });
 
   const tool: Anthropic.Messages.Tool = {
     name: opts.toolName,
@@ -98,6 +102,9 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
+      // Pass only `signal`, not `timeout`. The SDK's own timeout fires its
+      // own AbortController internally, and the two can race during stream
+      // cleanup, producing "The stream is not in a state that permits close".
       return await client.messages.create(
         {
           model: MODEL,
@@ -107,7 +114,7 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
           tool_choice: { type: "tool", name: opts.toolName },
           messages,
         },
-        { signal: controller.signal, timeout: TIMEOUT_MS },
+        { signal: controller.signal },
       );
     } catch (err) {
       if (
@@ -129,6 +136,13 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
       label: "anthropic.messages.create",
       retryOn: (err) => {
         if (err instanceof Error && err.name === "TimeoutError") return true;
+        // SDK / runtime race during stream cleanup. Idempotent retry.
+        if (
+          err instanceof TypeError &&
+          /stream is not in a state that permits close/i.test(err.message)
+        ) {
+          return true;
+        }
         // Anthropic SDK throws APIError with .status; 529 = overload, 5xx = transient
         const status = (err as { status?: number })?.status;
         if (typeof status === "number") return status === 529 || status >= 500;

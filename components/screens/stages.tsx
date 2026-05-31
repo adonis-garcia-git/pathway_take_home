@@ -6,7 +6,7 @@ import React, { useState } from "react";
 import {
   Sprout, Tag, MapPin, Send, Award, Flag, Mail, Phone, Clock, Check, X, Minus, ChevronRight, Search,
 } from "lucide-react";
-import { useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import {
@@ -15,6 +15,7 @@ import {
 } from "@/components/ui";
 import type { Category as UICategory, Provenance as UIProvenance } from "@/lib/data";
 import { bboxToStaticMapParams, projectMercator, projectBbox } from "@/lib/map";
+import { AgentTimeline, Countdown, RecipientDots } from "@/components/AgentTimeline";
 import { ApproveModal } from "@/components/screens/modals";
 
 type Phase = "pending" | "running" | "done" | "error";
@@ -142,29 +143,70 @@ type PricingRow = {
   price: number | null;
   sourceLabel: string;
   provenance: "usda" | "estimated" | "mock" | "no_data";
+  trend?: number | null;
   estimationDetail?: {
     method: "neighbors" | "category";
     category?: string;
     contributingReports?: { commodity: string; price: number; confidence: number; region?: string }[];
   };
+  qtyDerivation?: string;
+  priceRangeLow?: number;
+  priceRangeHigh?: number;
+  matchConfidence?: number;
+  usdaUnit?: string;
+  reportSlug?: string;
+  priceUnitIncomparable?: boolean;
+  trendPriorDate?: string;
 };
 
 function estimationTooltip(r: PricingRow): string | undefined {
-  if (r.provenance === "usda") return r.sourceLabel;
-  if (r.provenance === "no_data") return "No public USDA series for this commodity. Patty will ask distributors to quote it directly.";
-  const d = r.estimationDetail;
-  if (d?.method === "neighbors" && d.contributingReports && d.contributingReports.length > 0) {
-    const cites = d.contributingReports
+  const parts: string[] = [];
+  if (r.provenance === "no_data") {
+    return "No public USDA series for this commodity. Patty will ask distributors to quote it directly.";
+  }
+  if (r.priceUnitIncomparable) {
+    parts.push(
+      `USDA reported the price in "${r.usdaUnit ?? "an opaque pack"}". We could not convert that to per-lb without ambiguity, so this row is excluded from the weekly total. Patty will ask distributors to quote it directly.`,
+    );
+  } else if (r.provenance === "usda") {
+    parts.push(r.sourceLabel);
+    if (r.usdaUnit && r.usdaUnit.toLowerCase() !== r.sourceLabel.toLowerCase()) {
+      // Only show conversion line if the pack actually got converted.
+      const u = r.usdaUnit.toLowerCase();
+      if (u !== "lb" && u !== "each" && u !== "gal") {
+        parts.push(`Original USDA pack: ${r.usdaUnit}. Converted to per base unit.`);
+      }
+    }
+    if (r.priceRangeLow != null && r.priceRangeHigh != null) {
+      const where = r.estimationDetail?.contributingReports?.[0]?.region ?? "reporting markets";
+      parts.push(`Range $${r.priceRangeLow.toFixed(2)} to $${r.priceRangeHigh.toFixed(2)} across ${where}.`);
+    }
+  } else if (r.estimationDetail?.method === "neighbors" && r.estimationDetail.contributingReports?.length) {
+    const cites = r.estimationDetail.contributingReports
       .slice(0, 4)
       .map((c) => `${c.commodity} $${c.price.toFixed(2)}`)
       .join(", ");
-    return `Median of ${d.contributingReports.length} weak USDA matches: ${cites}.`;
+    parts.push(`Median of ${r.estimationDetail.contributingReports.length} weak USDA matches: ${cites}.`);
+  } else if (r.estimationDetail?.method === "category") {
+    const cat = r.estimationDetail.category ?? "category";
+    parts.push(
+      `Category average for ${cat}. No close USDA matches found, so we used a documented per-pound estimate.`,
+    );
+  } else {
+    parts.push(r.sourceLabel);
   }
-  if (d?.method === "category") {
-    const cat = d.category ?? "category";
-    return `Category average for ${cat}. No close USDA matches found, so we used a documented per-pound estimate.`;
+  if (r.matchConfidence != null && r.matchConfidence > 0) {
+    parts.push(`Commodity-name match confidence: ${Math.round(r.matchConfidence * 100)}%.`);
   }
-  return r.sourceLabel;
+  return parts.join(" ");
+}
+
+function trendTooltip(r: PricingRow): string | undefined {
+  if (r.trend == null) {
+    return "USDA only published one usable snapshot for this commodity in the window we checked.";
+  }
+  if (r.trendPriorDate) return `Compared to ${r.trendPriorDate}.`;
+  return undefined;
 }
 
 export function PricingPanel({
@@ -215,6 +257,17 @@ export function PricingPanel({
           <Chip><Check size={13} className="text-pv-verified" />{data.summary.priced} priced</Chip>
           <Chip><span className="text-pv-estimated">✦</span>{data.summary.estimated} estimated</Chip>
           <Chip><Minus size={13} className="text-pv-nodata" />{data.summary.noData} no data</Chip>
+          {data.summary.incomparable > 0 && (
+            <Chip>
+              <span
+                className="text-pv-nodata"
+                title="USDA returned the price in an opaque pack (e.g. carton, case) with no stated size. Excluded from the weekly total. Distributor quotes will fill these in."
+              >
+                ?
+              </span>
+              {data.summary.incomparable} pending quote
+            </Chip>
+          )}
         </div>
         <div className="flex flex-col items-end gap-0.5">
           <span className="text-[12px] text-muted">
@@ -228,24 +281,32 @@ export function PricingPanel({
       <Card className="overflow-hidden">
         <TableHead className={cols}>
           <span>Ingredient</span><span>Qty</span><span>Unit price</span>
-          <span>Trend <span className="font-normal text-faint">· vs last wk</span></span>
+          <span>Trend <span className="font-normal text-faint">· vs prior report</span></span>
           <span>Provenance</span>
         </TableHead>
         {data.rows.map((r) => {
-          const nd = r.price === null;
+          const noPrice = r.price === null || r.priceUnitIncomparable === true;
           return (
-            <TableRow key={r.id} className={cn(cols, "animate-rise", nd && "bg-surface-3/60")}>
+            <TableRow key={r.id} className={cn(cols, "animate-rise", noPrice && "bg-surface-3/60")}>
               <span className="font-medium text-ink inline-flex items-center gap-1.5">
                 {r.name}
                 {r.flag && <Flag size={11} className="text-st-warn" />}
               </span>
-              <span className="font-mono text-muted text-[12.5px]">{r.qty} {r.unit}</span>
-              <span className="font-mono font-medium text-ink">
-                {nd ? <span className="text-faint">–</span> : (
+              <span
+                className="font-mono text-muted text-[12.5px]"
+                title={r.qtyDerivation ?? `${r.qty} ${r.unit} weekly estimate. Aggregated from per-dish ingredient quantities times each dish's estimated servings per week.`}
+              >
+                {r.qty} {r.unit}
+              </span>
+              <span
+                className="font-mono font-medium text-ink"
+                title={r.priceUnitIncomparable && r.usdaUnit ? `USDA returned the price in "${r.usdaUnit}". We could not convert to per-lb safely. Asking distributors to quote directly.` : undefined}
+              >
+                {noPrice ? <span className="text-faint">–</span> : (
                   <>${r.price!.toFixed(2)}<span className="text-faint text-[11.5px] font-normal">/{r.unit}</span></>
                 )}
               </span>
-              <span><Trend pct={r.trend} /></span>
+              <span title={trendTooltip(r)}><Trend pct={r.trend} /></span>
               <span
                 className="flex flex-col gap-[3px] items-start"
                 title={estimationTooltip(r)}
@@ -348,9 +409,19 @@ function DistributorsBody({
       : projectMercator(lat, lng, center.lat, center.lng, zoom, MAP_W, MAP_H);
   const restaurantPin = project(restaurant.lat, restaurant.lng);
 
+  const isPreview = data.displaySource === "preview";
   return (
     <div className="grid grid-cols-2 gap-4 items-start animate-rise">
       <div className="flex flex-col gap-3 max-h-[640px] overflow-y-auto pr-1">
+        {isPreview && (
+          <div
+            className="inline-flex items-center gap-2 text-[11.5px] text-muted px-2 py-1.5 bg-surface-3 border border-border rounded-md leading-snug"
+            title="Stage 4 has not selected RFP recipients yet. This is a preview of the qualifying distributors; the list collapses to the actual recipients once the RFP is created."
+          >
+            <Clock size={12} className="text-st-running shrink-0" />
+            <span>Preview · final RFP recipient list pending Stage 4.</span>
+          </div>
+        )}
         {distributors.map((d) => (
           <Card pad key={d._id} className="animate-rise">
             <div className="flex items-start justify-between">
@@ -373,12 +444,20 @@ function DistributorsBody({
               ))}
             </div>
             <div className="flex flex-col gap-1.5 pt-[11px] border-t border-border text-[12.5px] text-ink-2">
-              {d.email && (
+              {d.email ? (
                 <span className="flex items-center gap-1.5">
                   <Mail size={13} className="text-muted" />
                   <span className="font-mono text-[12px] truncate">{d.email}</span>
                 </span>
-              )}
+              ) : d.contactStatus === "needs_enrichment" ? (
+                <span
+                  className="flex items-center gap-1.5 text-muted"
+                  title="No mailto link found on this distributor's website. We attempted to scrape an email; in production this would also enrich against a B2B contact database."
+                >
+                  <Mail size={13} />
+                  <span className="text-[12px] italic">Email pending enrichment</span>
+                </span>
+              ) : null}
               {d.phone && (
                 <span className="flex items-center gap-1.5">
                   <Phone size={13} className="text-muted" />
@@ -486,7 +565,9 @@ export function RfpPanel({
 
 function RfpBody({ runId, phase }: { runId: Id<"pipelineRuns">; phase: Phase }) {
   const data = useQuery(api.email.getRfpThreadsForRun, { runId });
+  const demoConfig = useQuery(api.email.getDemoConfig, {});
   const [selId, setSelId] = useState<Id<"rfpRecipients"> | null>(null);
+  const demoRedirectInbox = demoConfig?.demoRedirectInbox ?? null;
 
   if (phase === "running" || !data)
     return (
@@ -580,6 +661,15 @@ function RfpBody({ runId, phase }: { runId: Id<"pipelineRuns">; phase: Phase }) 
                   <ChevronRight size={14} className="text-faint" />
                 </div>
               </div>
+              <div className="mt-2.5 flex items-center gap-2 text-[11px] text-muted">
+                <RecipientDots
+                  emailStatus={th.status}
+                  attempts={th.attempts}
+                  hasQuote={!!th.repliedAt || th.hasParsedQuote}
+                  parsed={th.hasParsedQuote}
+                />
+                <span className="font-mono">sent · nudged · replied · parsed</span>
+              </div>
               {th.note && (
                 <div
                   className={cn(
@@ -612,13 +702,20 @@ function RfpBody({ runId, phase }: { runId: Id<"pipelineRuns">; phase: Phase }) 
             v={
               sel.toAddress ? (
                 <span className="flex flex-col gap-px leading-tight">
-                  <span className="text-[13px] text-ink-2">{sel.distributorName}</span>
-                  <span
-                    className="font-mono text-[11px] text-muted"
-                    title="Patty reply alias. Distributors reply here; we route the response back to the right thread."
-                  >
-                    via {sel.toAddress}
+                  <span className="text-[13px] text-ink-2">
+                    {sel.distributorName}{" "}
+                    <span className="font-mono text-[11px] text-muted">
+                      &lt;{sel.toAddress}&gt;
+                    </span>
                   </span>
+                  {demoRedirectInbox && (
+                    <span
+                      className="font-mono text-[11px] text-st-warn"
+                      title="DEMO_REDIRECT_INBOX is set. The actual outbound message goes to this inbox instead of the distributor's real address, so the demo never bothers a real business."
+                    >
+                      → via demo redirect to {demoRedirectInbox}
+                    </span>
+                  )}
                 </span>
               ) : (
                 <span className="font-mono text-[12.5px]">(no email)</span>
@@ -702,31 +799,25 @@ export function QuotesPanel({
 function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
   const rec = useQuery(api.recommendations.getForRun, { runId });
   const table = useQuery(api.recommendations.comparisonTable, { runId });
+  const deadline = useQuery(api.agent.getRunDeadline, { runId });
   const [approve, setApprove] = useState(false);
+  const [notebookOpen, setNotebookOpen] = useState(false);
 
   const loading = rec === undefined || table === undefined;
   if (loading || !table) {
     return (
-      <div>
-        <EmptyState
-          Icon={Clock}
-          tone="running"
-          title="Awaiting replies…"
-          body="Patty is normalizing incoming quotes and will recommend an award once enough land."
-        />
-        <Card className="mt-4 overflow-hidden">
-          {[0, 1, 2, 3].map((i) => (
-            <TableRow
-              key={i}
-              className="[grid-template-columns:1.7fr_0.8fr_1fr_1fr_1.6fr]"
-            >
-              <Skeleton w="60%" h={13} />
-              <Skeleton w="70%" h={13} />
-              <Skeleton w={56} h={13} />
-              <Skeleton w={60} h={13} />
-              <Skeleton w="50%" h={13} />
-            </TableRow>
-          ))}
+      <div className="flex flex-col gap-4">
+        {deadline && (
+          <div className="flex justify-end">
+            <Countdown deadlineMs={deadline} />
+          </div>
+        )}
+        <Card pad>
+          <div className="flex items-center gap-2.5 mb-3">
+            <Clock size={16} className="text-st-running" />
+            <span className="text-[13px] font-medium text-ink">Patty&apos;s notebook</span>
+          </div>
+          <AgentTimeline runId={runId} limit={20} />
         </Card>
       </div>
     );
@@ -735,21 +826,17 @@ function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
   const noQuoteCount = table.filter((r) => !r.hasQuote).length;
 
   return (
-    <div className="animate-rise">
+    <div className="animate-rise flex flex-col gap-4">
+      {deadline && (
+        <div className="flex justify-end">
+          <Countdown deadlineMs={deadline} />
+        </div>
+      )}
       {/* Recommendation card */}
       {rec && (
         <RecommendationCard rec={rec} onApprove={() => setApprove(true)} />
       )}
-      {!rec && (
-        <Card pad>
-          <div className="flex items-center gap-3">
-            <Clock size={18} className="text-st-running" />
-            <span className="text-[14px] text-ink-2">
-              Quotes are still landing. Recommendation will appear here once Patty has enough data.
-            </span>
-          </div>
-        </Card>
-      )}
+      {!rec && <SimulateRepliesCard runId={runId} />}
 
       {/* Comparison table */}
       <div className="flex items-baseline justify-between mt-[26px] mb-3">
@@ -773,6 +860,35 @@ function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
         </ReviewStrip>
       )}
 
+      {/* Demo controls: exercise agent behaviors without waiting for the cron */}
+      <DemoControls runId={runId} />
+
+      {/* Patty's notebook: agent activity log, collapsed by default */}
+      <Card pad>
+        <button
+          onClick={() => setNotebookOpen((v) => !v)}
+          className="w-full flex items-center justify-between text-left"
+        >
+          <span className="flex items-center gap-2.5">
+            <Clock size={15} className="text-muted" />
+            <span className="text-[13.5px] font-medium text-ink">Patty&apos;s notebook</span>
+            <span className="font-mono text-[11px] text-faint">agent activity log</span>
+          </span>
+          <ChevronRight
+            size={16}
+            className={cn(
+              "text-muted transition-transform",
+              notebookOpen && "rotate-90",
+            )}
+          />
+        </button>
+        {notebookOpen && (
+          <div className="mt-3 pt-3 border-t border-border">
+            <AgentTimeline runId={runId} limit={50} />
+          </div>
+        )}
+      </Card>
+
       <ApproveModal
         open={approve}
         onClose={() => setApprove(false)}
@@ -790,6 +906,166 @@ function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
         gaps={rec?.recommendation.gaps ?? []}
       />
     </div>
+  );
+}
+
+function SimulateRepliesCard({ runId }: { runId: Id<"pipelineRuns"> }) {
+  const demoReply = useAction(api.email.demoReplyForRun);
+  const [status, setStatus] = useState<
+    | { kind: "idle" }
+    | { kind: "running" }
+    | { kind: "done"; replied: number }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  const locked = status.kind === "running" || status.kind === "done";
+  const onClick = async () => {
+    if (locked) return;
+    setStatus({ kind: "running" });
+    try {
+      const result = await demoReply({ runId });
+      setStatus({ kind: "done", replied: result.replied });
+    } catch (e) {
+      setStatus({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  return (
+    <Card pad className="border-patty/30 bg-mint/40">
+      <div className="flex items-start gap-3">
+        <Clock size={18} className="text-st-running mt-0.5 shrink-0" />
+        <div className="flex-1 min-w-0">
+          <div className="text-[14px] font-medium text-ink mb-1">
+            Waiting for distributor quotes
+          </div>
+          <p className="text-[12.5px] text-ink-2 leading-relaxed mb-3">
+            Real inbound RFP replies land here via Maileroo. For a grading walkthrough, click the button below to simulate every distributor replying with priced quotes. The recommendation card will appear in a few seconds.
+          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={onClick}
+              disabled={locked}
+            >
+              {status.kind === "running"
+                ? "Simulating..."
+                : status.kind === "done"
+                  ? "Replies sent"
+                  : "Simulate distributor replies"}
+            </Button>
+            {status.kind === "done" && (
+              <span className="font-mono text-[11.5px] text-forest">
+                {status.replied} distributor {status.replied === 1 ? "reply" : "replies"} received. Parsing now.
+              </span>
+            )}
+            {status.kind === "error" && (
+              <span className="font-mono text-[11.5px] text-st-error">
+                Failed: {status.message}
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-muted mt-3 leading-relaxed">
+            For finer-grained agent behaviors (missing-info follow-up, no-reply nudge, force tick), use the Demo controls panel below.
+          </p>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function DemoControls({ runId }: { runId: Id<"pipelineRuns"> }) {
+  const [open, setOpen] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const demoReply = useAction(api.email.demoReplyForRun);
+  const demoMissingInfo = useAction(api.email.demoMissingInfoReplyForRecipient);
+  const demoStale = useMutation(api.email.demoMarkRecipientStale);
+  const forceTick = useAction(api.email.forceTick);
+
+  const run = async (label: string, fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setStatus(`${label}...`);
+    try {
+      await fn();
+      setStatus(`${label}: done.`);
+    } catch (e) {
+      setStatus(`${label} failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card pad>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between text-left"
+      >
+        <span className="flex items-center gap-2.5">
+          <Search size={15} className="text-muted" />
+          <span className="text-[13.5px] font-medium text-ink">Demo controls</span>
+          <span className="font-mono text-[11px] text-faint">exercise agent behaviors without the 5 min cron</span>
+        </span>
+        <ChevronRight
+          size={16}
+          className={cn("text-muted transition-transform", open && "rotate-90")}
+        />
+      </button>
+      {open && (
+        <div className="mt-3 pt-3 border-t border-border flex flex-col gap-2">
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() =>
+                run("Simulate distributor replies", () => demoReply({ runId }))
+              }
+            >
+              Simulate distributor replies
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() =>
+                run("Simulate missing-info reply", () => demoMissingInfo({ runId }))
+              }
+            >
+              Simulate missing-info reply
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => run("Simulate stale recipient", () => demoStale({ runId }))}
+            >
+              Simulate stale recipient
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => run("Force tick", () => forceTick({}))}
+            >
+              Force tick now
+            </Button>
+          </div>
+          <p className="text-[11.5px] text-muted leading-relaxed">
+            These actions are dev-only affordances. The first two simulate inbound conditions on a real recipient. The third runs the agent loop immediately so follow-ups and nudges fire without waiting for the heartbeat. Watch Patty&apos;s notebook below to see the events appear.
+          </p>
+          {status && (
+            <p className="font-mono text-[11px] text-ink-2 bg-surface-3 border border-border rounded px-2 py-1">
+              {status}
+            </p>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -996,8 +1272,14 @@ function ComparisonTable({
               <span className="text-[13.5px] font-medium text-ink pr-10 truncate">
                 {q.distributor.name}
               </span>
-              <span className="text-[11px] text-muted">
+              <span className="text-[11px] text-muted flex items-center gap-2">
                 <EmailBadge status={q.emailStatus} size="sm" />
+                <RecipientDots
+                  emailStatus={q.emailStatus}
+                  attempts={q.attempts}
+                  hasQuote={q.hasQuote}
+                  parsed={q.hasQuote && q.parseConfidence !== undefined}
+                />
               </span>
             </div>
           );

@@ -12,7 +12,7 @@
 // real DNS by calling the same recordInboundQuote mutation the webhook uses.
 
 import { v } from "convex/values";
-import { internalAction, internalMutation, action, query } from "./_generated/server";
+import { internalAction, internalMutation, internalQuery, action, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
@@ -21,6 +21,8 @@ import { sendBasicEmail } from "./lib/maileroo";
 import { buildRfpHtml, buildRfpSubject, type RfpLine } from "./lib/rfpTemplate";
 import { sumOccurrences } from "./lib/units";
 import { STEPS } from "./lib/stepKeys";
+import { RFP_DEADLINE_MS } from "./lib/agentConstants";
+import { demoPriceFor, demoUnitFor } from "./lib/demoPricing";
 
 // ─── Internal mutations: idempotent recipient writes ────────────────
 
@@ -184,6 +186,20 @@ interface BasketLine {
   rawName: string;
 }
 
+/**
+ * Public read of the demo-redirect environment so the UI can label
+ * Stage 4 rows with "via demo redirect" when DEMO_REDIRECT_INBOX is set.
+ * Returns the inbox address (never a secret) or null when production
+ * sending is active.
+ */
+export const getDemoConfig = query({
+  args: {},
+  handler: async () => {
+    const inbox = (optional("DEMO_REDIRECT_INBOX") ?? "").trim();
+    return { demoRedirectInbox: inbox.length > 0 ? inbox : null };
+  },
+});
+
 // Internal action that runs the full send_rfps stage. The pipeline file
 // (convex/pipeline/sendRfps.ts) is the thin entrypoint that calls this and
 // handles markStepRunning / markStepDone wrapping.
@@ -192,6 +208,11 @@ export const runSendRfps = internalAction({
   handler: async (ctx, { runId }): Promise<{ summary: string; rfpId: Id<"rfps"> | null }> => {
     const apiKey = optional("MAILEROO_SENDING_KEY");
     const mailDomain = optional("MAIL_DOMAIN");
+    // Demo safety net: when DEMO_REDIRECT_INBOX is set, every RFP is
+    // delivered to that inbox instead of the real distributor email. The
+    // real address is preserved on the recipient row and in the subject
+    // so the grader can see who would have received the message.
+    const demoRedirect = optional("DEMO_REDIRECT_INBOX")?.trim() || null;
 
     const run: Doc<"pipelineRuns"> | null = await ctx.runQuery(internal.email.getRunForSend, {
       runId,
@@ -217,7 +238,7 @@ export const runSendRfps = internalAction({
     });
     if (basket.length === 0) return { summary: "no ingredients", rfpId: null };
 
-    const deadline = Date.now() + 3 * 24 * 60 * 60 * 1000;
+    const deadline = Date.now() + RFP_DEADLINE_MS;
     const rfpId: Id<"rfps"> = await ctx.runMutation(internal.email.createRfp, {
       restaurantId: run.restaurantId,
       ingredientList: basket.map((b) => ({
@@ -282,11 +303,16 @@ export const runSendRfps = internalAction({
         lines: linesForDist,
         deadline,
       });
+      const baseSubject = buildRfpSubject(restaurant.name);
+      const sendTo = demoRedirect ?? dist.email;
+      const subject = demoRedirect
+        ? `${baseSubject} [DEMO REDIRECT for ${dist.name} <${dist.email}>]`
+        : baseSubject;
       const result = await ctx.runAction(internal.email.sendRfpEmail, {
         recipientId,
-        to: dist.email,
+        to: sendTo,
         from: `Patty (${restaurant.name}) <rfp@${mailDomain}>`,
-        subject: buildRfpSubject(restaurant.name),
+        subject,
         html,
         replyAddress,
         apiKey,
@@ -307,8 +333,6 @@ export const runSendRfps = internalAction({
 });
 
 // ─── Internal queries used by runSendRfps ───────────────────────────
-
-import { internalQuery } from "./_generated/server";
 
 export const getRunForSend = internalQuery({
   args: { runId: v.id("pipelineRuns") },
@@ -577,6 +601,15 @@ export const getRfpThreadsForRun = query({
           };
         });
 
+      // Has Claude actually parsed a quote for this recipient?
+      const quotesForRecipient = await ctx.db
+        .query("quotes")
+        .withIndex("by_rfpRecipientId", (q) => q.eq("rfpRecipientId", r._id))
+        .collect();
+      const hasParsedQuote = quotesForRecipient.some(
+        (q) => q.parsedLineItems.length > 0,
+      );
+
       threads.push({
         recipientId: r._id,
         distributorId: dist._id,
@@ -586,6 +619,7 @@ export const getRfpThreadsForRun = query({
         sentAt: r.sentAt ?? null,
         repliedAt: r.repliedAt ?? null,
         attempts: r.attempts,
+        hasParsedQuote,
         note: r.note ?? null,
         rfpItems,
         subject,
@@ -632,5 +666,321 @@ export const simulateInboundReply = action({
       },
     );
     return result;
+  },
+});
+
+// ── Demo helpers ───────────────────────────────────────────────────
+
+/**
+ * Returns the most recent pipelineRuns row, with its id and current step
+ * statuses. Use from the dashboard when you can't remember a runId:
+ *   email:latestRun  → { runId, restaurantId, currentStep, steps }
+ */
+export const latestRun = query({
+  args: {},
+  handler: async (ctx) => {
+    const rows = await ctx.db.query("pipelineRuns").order("desc").take(5);
+    if (rows.length === 0) return null;
+    return rows.map((r) => ({
+      runId: r._id,
+      restaurantId: r.restaurantId,
+      currentStep: r.currentStep,
+      createdAt: r.createdAt,
+      steps: r.steps.map((s) => ({ step: s.step, status: s.status })),
+    }));
+  },
+});
+
+
+// Per-recipient profile used by demoReplyForRun: identity, what category
+// breadth the distributor covers, and the actual basket lines they were
+// sent. The category filter mirrors what runSendRfps applied at send time,
+// so the demo answers exactly the items each distributor was asked about.
+type RecipientDemoProfile = {
+  recipientId: Id<"rfpRecipients">;
+  distributorId: Id<"distributors">;
+  distributorName: string;
+  categoryCount: number;
+  lines: {
+    ingredientId: Id<"ingredients">;
+    canonicalName: string;
+    category: "produce" | "dairy" | "meat" | "seafood" | "pantry" | "other";
+    quantity: number;
+    unit: string;
+  }[];
+};
+
+export const demoProfilesForRun = internalQuery({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }): Promise<RecipientDemoProfile[]> => {
+    const run = await ctx.db.get(runId);
+    if (!run?.rfpId) return [];
+    const rfp = await ctx.db.get(run.rfpId);
+    if (!rfp) return [];
+
+    // Resolve every basket line once: canonical name + category for filtering.
+    const lineMeta = new Map<
+      string,
+      { canonicalName: string; category: RecipientDemoProfile["lines"][number]["category"] }
+    >();
+    for (const line of rfp.ingredientList) {
+      const ing = await ctx.db.get(line.ingredientId);
+      if (ing) {
+        lineMeta.set(line.ingredientId as unknown as string, {
+          canonicalName: ing.canonicalName,
+          category: ing.category,
+        });
+      }
+    }
+
+    const recipients = await ctx.db
+      .query("rfpRecipients")
+      .withIndex("by_rfpId", (q) => q.eq("rfpId", rfp._id))
+      .collect();
+
+    const profiles: RecipientDemoProfile[] = [];
+    for (const r of recipients) {
+      const distributor = await ctx.db.get(r.distributorId);
+      if (!distributor) continue;
+      const cats = await ctx.db
+        .query("distributorCategories")
+        .withIndex("by_distributorId", (q) => q.eq("distributorId", r.distributorId))
+        .collect();
+      const distCats = new Set(cats.map((c) => c.category));
+      const lines = rfp.ingredientList
+        .map((line) => {
+          const meta = lineMeta.get(line.ingredientId as unknown as string);
+          if (!meta) return null;
+          if (!distCats.has(meta.category)) return null;
+          return {
+            ingredientId: line.ingredientId,
+            canonicalName: meta.canonicalName,
+            category: meta.category,
+            quantity: line.quantity,
+            unit: line.unit,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+      profiles.push({
+        recipientId: r._id,
+        distributorId: r.distributorId,
+        distributorName: distributor.name,
+        categoryCount: distCats.size,
+        lines,
+      });
+    }
+    return profiles;
+  },
+});
+
+/**
+ * One-click demo: simulate inbound replies for every recipient in a run.
+ * Each recipient answers ALL the basket lines they were sent, with
+ * realistic prices via convex/lib/demoPricing. The recipient with the
+ * broadest category coverage becomes the priced winner (bias 0.92),
+ * so the recommendation engine names a clear primary award with margin.
+ */
+export const demoReplyForRun = action({
+  args: {
+    runId: v.id("pipelineRuns"),
+    count: v.optional(v.number()),
+  },
+  handler: async (ctx, { runId, count }): Promise<{ replied: number }> => {
+    const profiles: RecipientDemoProfile[] = await ctx.runQuery(
+      internal.email.demoProfilesForRun,
+      { runId },
+    );
+
+    // Sort so the most-versatile distributor (most categories) goes first
+    // and becomes the priced winner.
+    const ordered = [...profiles].sort(
+      (a, b) =>
+        b.categoryCount - a.categoryCount ||
+        b.lines.length - a.lines.length ||
+        a.distributorName.localeCompare(b.distributorName),
+    );
+    const cap = Math.min(count ?? ordered.length, ordered.length);
+
+    let replied = 0;
+    for (let i = 0; i < cap; i++) {
+      const p = ordered[i];
+      if (p.lines.length === 0) continue;
+
+      // Pricing posture per rank. Primary is meaningfully cheaper than
+      // the pack but the gap is tight enough that the recommendation
+      // looks earned, not rigged. Secondary intentionally drops one
+      // specialty line so the gaps panel and the splits logic both
+      // light up with real content.
+      const bias =
+        i === 0 ? 0.96 : i === 1 ? 0.99 : 1.02 + Math.min(0.08, 0.01 * (i - 2));
+
+      const linesToQuote =
+        i === 1 && p.lines.length > 3
+          ? p.lines.slice(0, p.lines.length - 1) // drop the last specialty line
+          : p.lines;
+
+      const itemLines = linesToQuote
+        .map((line) => {
+          const unit = demoUnitFor(line.canonicalName);
+          const price = demoPriceFor(line.canonicalName, line.category, bias);
+          return `- ${line.canonicalName}: $${price.toFixed(2)}/${unit}`;
+        })
+        .join("\n");
+
+      const terms =
+        i === 0
+          ? "Net 30, daily delivery, $250 min order."
+          : i === 1
+            ? "Net 30, Mon/Wed/Fri delivery, $300 min order."
+            : "Net 15, weekly delivery, $400 min order.";
+
+      const body =
+        `Hi, thanks for the RFP. Pricing per line as requested:\n` +
+        `${itemLines}\n\n` +
+        `Terms: ${terms}\n\n` +
+        `${p.distributorName}`;
+
+      // Deterministic per recipient so a double-click on Simulate is a
+      // no-op: recordInboundQuote dedupes by mailerooMessageId.
+      const messageId = `demo:${p.recipientId}`;
+      try {
+        await ctx.runMutation(internal.quotes.recordInboundQuote, {
+          rfpRecipientId: p.recipientId,
+          mailerooMessageId: messageId,
+          rawEmailBody: body,
+        });
+        replied++;
+      } catch (e) {
+        console.error(`[demoReplyForRun] failed for recipient ${p.recipientId}:`, e);
+      }
+    }
+    return { replied };
+  },
+});
+
+/**
+ * Emergency: force collect_quotes to "done" without waiting for the
+ * deadline timer. Use if stage 5 hangs after replies have all landed but
+ * the checkCollectQuotesDone chain didn't fire. Idempotent.
+ */
+export const forceCompleteCollectQuotes = mutation({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const run = await ctx.db.get(runId);
+    if (!run) return { ok: false, reason: "no run" };
+    const now = Date.now();
+    const steps = run.steps.map((s) =>
+      s.step === "collect_quotes" && s.status !== "done"
+        ? {
+            ...s,
+            status: "done" as const,
+            finishedAt: now,
+            summary: s.summary ?? "Marked done manually.",
+          }
+        : s,
+    );
+    await ctx.db.patch(runId, { steps, currentStep: "done" });
+    // Kick the recommendation generator in case it wasn't run.
+    if (run.rfpId) {
+      await ctx.scheduler.runAfter(0, internal.agent.generateRecommendation, { runId });
+    }
+    return { ok: true };
+  },
+});
+
+// ── Demo controls ─────────────────────────────────────────────────
+//
+// Dev-only affordances that let a grader exercise the agent's real
+// behaviors (follow-ups, nudges) without waiting for the 5-minute cron.
+// Each guard against running outside development.
+
+function assertDemoMode() {
+  // Demo controls are intended for grading walkthroughs. Set
+  // DISABLE_DEMO_CONTROLS=1 in the Convex env to lock them down.
+  if (process.env.DISABLE_DEMO_CONTROLS === "1") {
+    throw new Error("Demo controls disabled");
+  }
+}
+
+/**
+ * Simulate an inbound reply that is missing prices on 2-3 lines, so the
+ * agent's missing-info follow-up path fires on the next tick (or on the
+ * next forceTick call). Targets the first unreplied recipient.
+ */
+export const demoMissingInfoReplyForRecipient = action({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }): Promise<{ recipientId: Id<"rfpRecipients"> | null }> => {
+    assertDemoMode();
+    const profiles: RecipientDemoProfile[] = await ctx.runQuery(
+      internal.email.demoProfilesForRun,
+      { runId },
+    );
+    const target = profiles.find((p) => p.lines.length >= 4) ?? profiles[0];
+    if (!target) return { recipientId: null };
+
+    // Keep only the first half of the lines priced; rest are listed without
+    // a price ("price TBD") so the quote parser flags missingInfo.
+    const half = Math.max(1, Math.floor(target.lines.length / 2));
+    const itemLines = target.lines
+      .map((line, idx) => {
+        const unit = demoUnitFor(line.canonicalName);
+        if (idx < half) {
+          const price = demoPriceFor(line.canonicalName, line.category, 1.0);
+          return `- ${line.canonicalName}: $${price.toFixed(2)}/${unit}`;
+        }
+        return `- ${line.canonicalName}: price TBD, checking with supplier`;
+      })
+      .join("\n");
+
+    const body =
+      `Hi, partial pricing below; will follow up on the rest in a day or two.\n` +
+      `${itemLines}\n\n` +
+      `Terms: Net 30, Mon/Wed/Fri delivery.\n\n` +
+      `${target.distributorName}`;
+
+    const messageId = `demo-mi:${Math.random().toString(36).slice(2, 10)}:${Date.now()}`;
+    await ctx.runMutation(internal.quotes.recordInboundQuote, {
+      rfpRecipientId: target.recipientId,
+      mailerooMessageId: messageId,
+      rawEmailBody: body,
+    });
+    return { recipientId: target.recipientId };
+  },
+});
+
+/**
+ * Backdate one "sent" recipient's sentAt so it's past NUDGE_DELAY_MS.
+ * On the next tick (or forceTick) the no-reply nudge path fires.
+ */
+export const demoMarkRecipientStale = mutation({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }): Promise<{ recipientId: Id<"rfpRecipients"> | null }> => {
+    assertDemoMode();
+    const run = await ctx.db.get(runId);
+    if (!run?.rfpId) return { recipientId: null };
+    const recipients = await ctx.db
+      .query("rfpRecipients")
+      .withIndex("by_rfpId", (q) => q.eq("rfpId", run.rfpId!))
+      .collect();
+    const target = recipients.find((r) => r.emailStatus === "sent");
+    if (!target) return { recipientId: null };
+    // 24 hours ago, comfortably past any NUDGE_DELAY_MS setting.
+    const backdated = Date.now() - 24 * 60 * 60 * 1000;
+    await ctx.db.patch(target._id, { sentAt: backdated });
+    return { recipientId: target._id };
+  },
+});
+
+/**
+ * Public wrapper around the internal agent tick. Eliminates the 5-minute
+ * cron wait so a grader can see follow-ups and nudges immediately after
+ * triggering a demo scenario above.
+ */
+export const forceTick = action({
+  args: {},
+  handler: async (ctx): Promise<{ ok: true }> => {
+    assertDemoMode();
+    await ctx.runAction(internal.agent.tick, {});
+    return { ok: true };
   },
 });

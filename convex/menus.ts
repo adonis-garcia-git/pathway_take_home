@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import {
+  action,
   internalAction,
   internalMutation,
   internalQuery,
@@ -12,6 +13,7 @@ import { STEPS } from "./lib/stepKeys";
 import { aggregateIngredients, type ParsedDish } from "./lib/aggregate";
 import { extractMenu, type MenuContent } from "./lib/anthropic";
 import { fetchUrlAsText } from "./lib/fetchUrl";
+import { geocodeAddress } from "./lib/geocode";
 import type { MenuExtraction } from "./lib/schemas";
 import { sumOccurrences } from "./lib/units";
 
@@ -28,14 +30,11 @@ export const generateUploadUrl = mutation({
 });
 
 /**
- * Create a real (non-seed) pipeline run from user-supplied menu input.
- * Inserts restaurants + menus + pipelineRuns (parse_menu / pending) and
- * returns the runId — caller then invokes `pipelineRuns.startPipeline`.
- *
- * lat/lng default to (0,0). Real geocoding is a follow-up; the distributors
- * stage already falls back to its seeded mock catalog regardless.
+ * Internal mutation that writes the restaurants + menus + pipelineRuns
+ * rows. Pure transactional write, no external IO. Called by the
+ * `createFromMenu` action below after it has geocoded the address.
  */
-export const createFromMenu = mutation({
+export const writeMenuRow = internalMutation({
   args: {
     sourceType: v.union(
       v.literal("url"),
@@ -47,14 +46,18 @@ export const createFromMenu = mutation({
     restaurantName: v.string(),
     address: v.string(),
     sourceUrl: v.optional(v.string()),
+    lat: v.number(),
+    lng: v.number(),
+    geocodeStatus: v.union(v.literal("ok"), v.literal("seeded"), v.literal("failed")),
   },
   handler: async (ctx, args) => {
     const restaurantId: Id<"restaurants"> = await ctx.db.insert("restaurants", {
       name: args.restaurantName,
       address: args.address,
-      lat: 0,
-      lng: 0,
+      lat: args.lat,
+      lng: args.lng,
       sourceUrl: args.sourceUrl,
+      geocodeStatus: args.geocodeStatus,
     });
 
     const menuId: Id<"menus"> = await ctx.db.insert("menus", {
@@ -72,6 +75,43 @@ export const createFromMenu = mutation({
     });
 
     return { restaurantId, menuId, runId };
+  },
+});
+
+/**
+ * Public action invoked by the start screen. Geocodes the address via
+ * Nominatim (free, no key) and then writes the rows. On geocode failure
+ * the rows are still written with lat/lng = (0, 0) and a "failed" marker,
+ * since downstream Places search uses the address string and the
+ * distributors fallback uses the mock catalog.
+ */
+export const createFromMenu = action({
+  args: {
+    sourceType: v.union(
+      v.literal("url"),
+      v.literal("text"),
+      v.literal("image"),
+      v.literal("pdf"),
+    ),
+    rawSource: v.string(),
+    restaurantName: v.string(),
+    address: v.string(),
+    sourceUrl: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ restaurantId: Id<"restaurants">; menuId: Id<"menus">; runId: Id<"pipelineRuns"> }> => {
+    const geo = await geocodeAddress(args.address);
+    const lat = geo?.lat ?? 0;
+    const lng = geo?.lng ?? 0;
+    const geocodeStatus: "ok" | "failed" = geo ? "ok" : "failed";
+    return await ctx.runMutation(internal.menus.writeMenuRow, {
+      ...args,
+      lat,
+      lng,
+      geocodeStatus,
+    });
   },
 });
 
@@ -220,22 +260,31 @@ export const writeParseResult = internalMutation({
     const extr = extraction as MenuExtraction;
 
     // Insert dishes; remember dishIndex → dishId mapping for the join.
+    // Also remember each dish's servings-per-week so we can scale the
+    // per-serving ingredient quantities into weekly demand.
     const dishIdByIndex = new Map<number, Id<"dishes">>();
+    const servingsPerWeekByIndex = new Map<number, number>();
     for (let i = 0; i < extr.dishes.length; i++) {
       const d = extr.dishes[i];
+      const servingsPerWeek = d.estimatedServingsPerWeek ?? 50;
       const dishId = await ctx.db.insert("dishes", {
         menuId,
         name: d.name,
         description: d.description,
         confidence: d.confidence,
         needsReview: d.needsReview,
+        estimatedServingsPerWeek: servingsPerWeek,
       });
       dishIdByIndex.set(i, dishId);
+      servingsPerWeekByIndex.set(i, servingsPerWeek);
     }
 
-    // Aggregate ingredients across dishes (synonyms + fuzzy + roll-up).
+    // Aggregate ingredients across dishes (synonyms + fuzzy + roll-up). The
+    // aggregator scales each occurrence's per-serving quantity by the
+    // owning dish's servings-per-week so the final basket holds real
+    // weekly demand rather than per-plate quantities.
     const parsed: ParsedDish[] = extr.dishes.map((d, idx) => ({ ...d, dishIndex: idx }));
-    const aggregated = aggregateIngredients(parsed);
+    const aggregated = aggregateIngredients(parsed, servingsPerWeekByIndex);
 
     // Upsert master ingredients keyed by canonicalName + write per-dish rows.
     let ingredientRows = 0;
@@ -301,6 +350,15 @@ export const runParseMenuAction = internalAction({
       content = [{ type: "text", text: menu.rawSource }];
     } else if (menu.sourceType === "url") {
       const text = await fetchUrlAsText(menu.rawSource);
+      // Many modern restaurant sites are JavaScript SPAs. After stripping
+      // tags the static HTML can be empty or near-empty. Catch that here
+      // with a clear error instead of letting Claude come back with an
+      // empty dishes array.
+      if (text.trim().length < 200) {
+        throw new Error(
+          `URL returned too little usable text (${text.trim().length} chars after stripping HTML). The page may be a JavaScript SPA. Paste the menu text directly instead.`,
+        );
+      }
       content = [
         {
           type: "text",

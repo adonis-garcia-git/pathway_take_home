@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { internalAction, internalMutation, query } from "./_generated/server";
+import { internalAction, internalMutation, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
@@ -10,6 +10,8 @@ import {
   DEFAULT_SEARCH_RADIUS_METERS,
   WIDE_SEARCH_RADIUS_METERS,
 } from "./lib/places";
+import { scrapeEmailFromWebsite } from "./lib/emailScrape";
+import { runWithConcurrency } from "./lib/concurrency";
 
 // ── types ──────────────────────────────────────────────────────────
 
@@ -154,6 +156,7 @@ export const seedDistributors = internalMutation({
           email: "", // patched below once we know the id
           source: "mock",
           externalId,
+          contactStatus: "verified",
         });
         await ctx.db.patch(distributorId, {
           email: replyAddressFor(distributorId, mailDomain),
@@ -185,6 +188,70 @@ export const seedDistributors = internalMutation({
   },
 });
 
+// ── internal mutation: persist a scraped email on a distributor ────
+
+/**
+ * Patch a distributor with a scraped email and flip its contactStatus to
+ * "verified". Idempotent: a second call with the same email is a no-op.
+ * Refuses to overwrite a non-empty email.
+ */
+export const setDistributorEmail = internalMutation({
+  args: { distributorId: v.id("distributors"), email: v.string() },
+  handler: async (ctx, { distributorId, email }) => {
+    const d = await ctx.db.get(distributorId);
+    if (!d) return;
+    if (d.email && d.email.length > 0) return;
+    await ctx.db.patch(distributorId, {
+      email,
+      contactStatus: "verified",
+    });
+  },
+});
+
+// ── public mutation: clean out any legacy mock distributors ────────
+
+/**
+ * One-shot cleanup. Removes every `source: "mock"` distributor along with
+ * its category rows and any rfpRecipients referencing it. Run once from
+ * the Convex dashboard after deploying Phase 17. Safe to re-run; idempotent.
+ */
+export const purgeMockDistributors = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const mocks = await ctx.db
+      .query("distributors")
+      .withIndex("by_source", (q) => q.eq("source", "mock"))
+      .collect();
+
+    let categoriesDeleted = 0;
+    let recipientsDeleted = 0;
+    for (const d of mocks) {
+      const cats = await ctx.db
+        .query("distributorCategories")
+        .withIndex("by_distributorId", (q) => q.eq("distributorId", d._id))
+        .collect();
+      for (const c of cats) {
+        await ctx.db.delete(c._id);
+        categoriesDeleted++;
+      }
+      const recipients = await ctx.db
+        .query("rfpRecipients")
+        .withIndex("by_distributorId", (q) => q.eq("distributorId", d._id))
+        .collect();
+      for (const r of recipients) {
+        await ctx.db.delete(r._id);
+        recipientsDeleted++;
+      }
+      await ctx.db.delete(d._id);
+    }
+    return {
+      distributorsDeleted: mocks.length,
+      categoriesDeleted,
+      recipientsDeleted,
+    };
+  },
+});
+
 // ── internal mutation: upsert a Places-discovered distributor ─────
 
 export const upsertPlacesDistributor = internalMutation({
@@ -206,11 +273,12 @@ export const upsertPlacesDistributor = internalMutation({
 
     let distributorId: Id<"distributors">;
     let wasNew = false;
+    let currentEmail = "";
 
     if (existing) {
       distributorId = existing._id;
-      // Keep contact info fresh on re-discovery; don't overwrite email
-      // (Places has none — email stays "" so send_rfps will skip it).
+      currentEmail = existing.email;
+      // Keep contact info fresh on re-discovery; don't overwrite email.
       await ctx.db.patch(distributorId, {
         name: args.name,
         address: args.address,
@@ -227,9 +295,10 @@ export const upsertPlacesDistributor = internalMutation({
         lng: args.lng,
         phone: args.phone,
         website: args.website,
-        email: "", // Places gives no email — documented in docs/distributor-seed.md
+        email: "", // Places gives no email; we scrape it from the website after upsert.
         source: "google_places",
         externalId: args.externalId,
+        contactStatus: "needs_enrichment",
       });
       wasNew = true;
     }
@@ -248,7 +317,16 @@ export const upsertPlacesDistributor = internalMutation({
       });
     }
 
-    return { distributorId, wasNew };
+    // Tell the caller whether this row still needs email enrichment so
+    // discoverFromPlaces can schedule a website scrape outside the
+    // mutation (mutations can't do network IO).
+    const needsEmailScrape = currentEmail === "" && Boolean(args.website);
+    return {
+      distributorId,
+      wasNew,
+      needsEmailScrape,
+      website: args.website ?? null,
+    };
   },
 });
 
@@ -270,6 +348,8 @@ export const discoverFromPlaces = internalAction({
   },
   handler: async (ctx, { address, lat, lng }) => {
     const seen = new Set<string>(); // tracks places.id we've already upserted
+    // distributorId → website url for the post-upsert email scrape pass.
+    const scrapeQueue = new Map<Id<"distributors">, string>();
 
     let newCount = 0;
     let existingCount = 0;
@@ -306,10 +386,9 @@ export const discoverFromPlaces = internalAction({
       }
 
       for (const place of results) {
-        const externalId = place.id; // raw Places id; mocks use "mock:<slug>"
-        const { wasNew } = await ctx.runMutation(
-          internal.distributors.upsertPlacesDistributor,
-          {
+        const externalId = place.id; // raw Places id; legacy mocks used "mock:<slug>"
+        const { wasNew, distributorId, needsEmailScrape, website } =
+          await ctx.runMutation(internal.distributors.upsertPlacesDistributor, {
             externalId,
             name: place.name,
             address: place.address,
@@ -318,15 +397,36 @@ export const discoverFromPlaces = internalAction({
             phone: place.phone,
             website: place.website,
             category,
-          },
-        );
+          });
 
         if (!seen.has(externalId)) {
           seen.add(externalId);
           if (wasNew) newCount++;
           else existingCount++;
         }
+
+        if (needsEmailScrape && website && !scrapeQueue.has(distributorId)) {
+          scrapeQueue.set(distributorId, website);
+        }
       }
+    }
+
+    // Best-effort website email scraping. Bounded concurrency keeps
+    // total Stage 3 latency under ~20s even with 30+ candidates. Each
+    // scrape has a 3s budget per page and never throws.
+    let emailsFound = 0;
+    const scrapeTargets = [...scrapeQueue.entries()];
+    if (scrapeTargets.length > 0) {
+      await runWithConcurrency(scrapeTargets, 4, async ([distributorId, website]) => {
+        const email = await scrapeEmailFromWebsite(website);
+        if (email) {
+          await ctx.runMutation(internal.distributors.setDistributorEmail, {
+            distributorId,
+            email,
+          });
+          emailsFound += 1;
+        }
+      });
     }
 
     return {
@@ -334,6 +434,7 @@ export const discoverFromPlaces = internalAction({
       newDistributors: newCount,
       existingDistributors: existingCount,
       widenedCategories,
+      emailsScraped: emailsFound,
     };
   },
 });
@@ -364,8 +465,10 @@ export const getDistributorsForRun = query({
     const restaurant = await ctx.db.get(run.restaurantId);
     if (!restaurant) return null;
 
-    // Prefer the distributors that actually got RFPs (rfpRecipients exists).
-    // Fallback: scan all distributors (find_distributors step ran but RFP not yet created).
+    // displaySource tells the UI which list it's looking at: the final
+    // recipients of this RFP (post-Stage-4), or a Stage-3 preview of
+    // distributors that would qualify if Stage 4 ran right now.
+    let displaySource: "recipients" | "preview" = "preview";
     let distributorIds: Set<Id<"distributors">> = new Set();
     if (run.rfpId) {
       const recipients = await ctx.db
@@ -373,6 +476,7 @@ export const getDistributorsForRun = query({
         .withIndex("by_rfpId", (q) => q.eq("rfpId", run.rfpId!))
         .collect();
       for (const r of recipients) distributorIds.add(r.distributorId);
+      if (distributorIds.size > 0) displaySource = "recipients";
     }
 
     let docs: Doc<"distributors">[];
@@ -383,7 +487,10 @@ export const getDistributorsForRun = query({
         if (d) docs.push(d);
       }
     } else {
-      docs = await ctx.db.query("distributors").collect();
+      // Stage-3 preview: only show Places-discovered rows (no legacy mocks),
+      // so Stage 3 and Stage 4 share the same population once Stage 4 runs.
+      const all = await ctx.db.query("distributors").collect();
+      docs = all.filter((d) => d.source === "google_places");
     }
     if (docs.length === 0) return null;
 
@@ -411,6 +518,7 @@ export const getDistributorsForRun = query({
     return {
       restaurant: { lat: restaurant.lat, lng: restaurant.lng },
       distributors: out.slice(0, 20),
+      displaySource,
     };
   },
 });

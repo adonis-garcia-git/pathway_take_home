@@ -40,6 +40,10 @@ export default defineSchema({
     // Idempotency key for seed-style replays (e.g., "demo:frankies-457").
     // Real user-created restaurants leave this undefined.
     externalId: v.optional(v.string()),
+    // Geocoding outcome. "ok" = real lat/lng from Nominatim; "seeded" =
+    // hardcoded for sample data; "failed" = (0, 0) fallback after a
+    // Nominatim error/no-results.
+    geocodeStatus: v.optional(v.union(v.literal("ok"), v.literal("seeded"), v.literal("failed"))),
   }).index("by_externalId", ["externalId"]),
 
   menus: defineTable({
@@ -55,6 +59,10 @@ export default defineSchema({
     description: v.optional(v.string()),
     confidence,
     needsReview: v.boolean(),
+    // Estimated weekly servings for this dish. Used to scale per-serving
+    // ingredient quantities into weekly demand. Optional because older rows
+    // pre-dating this field default to 50 at read time.
+    estimatedServingsPerWeek: v.optional(v.number()),
   }).index("by_menuId", ["menuId"]),
 
   ingredients: defineTable({
@@ -96,6 +104,22 @@ export default defineSchema({
     matchConfidence: v.number(),
     unmatched: v.boolean(),
     trend: v.optional(v.number()),
+    // Prior report date used as the trend's denominator (YYYY-MM-DD).
+    // Surfaced in the UI tooltip so "vs prior report" reads honestly.
+    trendPriorDate: v.optional(v.string()),
+    // USDA-returned unit before our pack normalization (e.g. "cwt",
+    // "25 lb carton"). Persisted so the tooltip can explain how a per-lb
+    // price was derived.
+    usdaUnit: v.optional(v.string()),
+    // The MARS report slug the price came from. Used to label rows whose
+    // region field is missing and to flag rows from unverified report
+    // routings in the UI.
+    reportSlug: v.optional(v.string()),
+    // True when USDA returned the price in an opaque pack ("carton" with
+    // no stated size, etc.) and we couldn't safely convert it to per-lb.
+    // The UI renders the price as missing and excludes the row from the
+    // weekly basket total.
+    priceUnitIncomparable: v.optional(v.boolean()),
     rawUsdaPayload: v.optional(v.any()),
     // Provenance for source = "estimated". When "neighbors", we computed
     // the median of weak USDA matches; when "category", we used the static
@@ -130,6 +154,10 @@ export default defineSchema({
     email: v.string(),
     source: v.union(v.literal("google_places"), v.literal("mock")),
     externalId: v.optional(v.string()),
+    // "verified" = reply-routable email on file; "needs_enrichment" =
+    // discovered via Places but no contact email (would enrich against
+    // a B2B database in production).
+    contactStatus: v.optional(v.union(v.literal("verified"), v.literal("needs_enrichment"))),
   })
     .index("by_source", ["source"])
     .index("by_externalId", ["externalId"]),
@@ -205,8 +233,10 @@ export default defineSchema({
     missingInfo: v.boolean(),
     rawEmailBody: v.string(),
     mailerooMessageId: v.string(),
-    // Idempotency marker for the missing-info follow-up. Cron only fires when
-    // missingInfo === true AND this is null.
+    // Idempotency marker for the missing-info follow-up on THIS quote row.
+    // Each inbound reply creates a new quote row, so a distributor that
+    // replies again gets a fresh follow-up scan. The two-round cap is
+    // enforced upstream via rfpRecipients.attempts vs MAX_ATTEMPTS.
     missingInfoFollowUpSentAt: v.optional(v.number()),
     // Optional extras the LLM extractor may populate; persisted for the
     // comparison-table UI without forcing nullable everywhere else.
@@ -233,7 +263,9 @@ export default defineSchema({
       }),
     ),
     createdAt: v.number(),
-  }).index("by_restaurantId", ["restaurantId"]),
+  })
+    .index("by_restaurantId", ["restaurantId"])
+    .index("by_rfpId", ["rfpId"]),
 
   recommendations: defineTable({
     runId: v.id("pipelineRuns"),
@@ -259,4 +291,33 @@ export default defineSchema({
   })
     .index("by_runId", ["runId"])
     .index("by_rfpId", ["rfpId"]),
+
+  // Singleton row used by the optional debounced scheduleNextTick helper.
+  // The shipping agent runs from the 5 minute cron in crons.ts and does
+  // not write this row; it stays here for future use.
+  agentSchedule: defineTable({
+    nextRunAt: v.optional(v.number()),
+  }),
+
+  // Append-only narrative log of what the autonomous agent did. Drives the
+  // <AgentTimeline> in stage 5 and the topbar ticker. Every state-changing
+  // action writes a row.
+  agentEvents: defineTable({
+    runId: v.id("pipelineRuns"),
+    at: v.number(),
+    kind: v.union(
+      v.literal("tick_scan"),
+      v.literal("follow_up_sent"),
+      v.literal("nudge_sent"),
+      v.literal("quote_received"),
+      v.literal("quote_parsed"),
+      v.literal("recommendation_written"),
+      v.literal("scheduled"),
+      v.literal("send_failed"),
+    ),
+    summary: v.string(),
+    recipientId: v.optional(v.id("rfpRecipients")),
+    distributorName: v.optional(v.string()),
+    nextTickAt: v.optional(v.number()),
+  }).index("by_runId_and_at", ["runId", "at"]),
 });

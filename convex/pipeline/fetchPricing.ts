@@ -12,7 +12,7 @@ export const runFetchPricing = internalAction({
       await ctx.runMutation(internal.pipelineRuns.markStepRunning, { runId, step });
       const { summary } = await ctx.runAction(internal.pricing.fetchAllPricesAction, {});
       await ctx.runMutation(internal.pipelineRuns.markStepDone, { runId, step, summary });
-      await ctx.runAction(internal.pipeline.index.scheduleNext, { runId, justFinished: step });
+      await ctx.runMutation(internal.pipeline.index.scheduleNext, { runId, justFinished: step });
     } catch (e) {
       await ctx.runMutation(internal.pipelineRuns.markStepError, {
         runId,

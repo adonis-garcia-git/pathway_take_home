@@ -153,10 +153,36 @@ export const mailerooInboundSchema = z.object({
 
 export type MailerooInbound = z.infer<typeof mailerooInboundSchema>;
 
+// Hostnames we'll fetch validation_url against. A forged inbound webhook
+// could try to point validation_url at internal infra; restrict to
+// Maileroo-owned hosts to prevent SSRF. Localhost is allowed for tests.
+const MAILEROO_HOST_SUFFIXES = [".maileroo.com", "maileroo.com"];
+const LOCAL_VALIDATION_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+function isAllowedValidationHost(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+  const host = parsed.hostname.toLowerCase();
+  if (LOCAL_VALIDATION_HOSTS.has(host)) return true;
+  return MAILEROO_HOST_SUFFIXES.some(
+    (s) => host === s.replace(/^\./, "") || host.endsWith(s),
+  );
+}
+
 // Call the payload's validation_url to confirm Maileroo really sent this
 // webhook. The docs accept either GET or POST; we try GET first then POST.
 // Expected success shape: { success: true }.
 export async function verifyMailerooInbound(validationUrl: string): Promise<boolean> {
+  // SSRF guard: only fetch URLs whose host is Maileroo (or localhost for tests).
+  if (!isAllowedValidationHost(validationUrl)) {
+    console.warn(`[maileroo.verify] rejected validation_url: ${validationUrl}`);
+    return false;
+  }
   // 5s per method, no retry — Maileroo redelivers on a non-2xx response,
   // so retrying here just delays the redelivery loop.
   const tryMethod = async (method: "GET" | "POST"): Promise<boolean> => {

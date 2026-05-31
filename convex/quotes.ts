@@ -80,8 +80,9 @@ export const recordInboundQuote = internalMutation({
     // (4) Kick the Claude parser to fill in parsedLineItems + recommendation.
     await ctx.scheduler.runAfter(0, internal.quotes.parseInboundQuote, { quoteId });
 
-    // (5) Trigger collect_quotes completion check on the owning run.
+    // (5) Trigger collect_quotes completion check on the owning run + log it.
     const rfp = await ctx.db.get(recipient.rfpId);
+    let owningRunId: Id<"pipelineRuns"> | null = null;
     if (rfp) {
       const runs = await ctx.db
         .query("pipelineRuns")
@@ -89,11 +90,24 @@ export const recordInboundQuote = internalMutation({
         .collect();
       const run = runs.find((r) => r.rfpId === rfp._id) ?? runs[0];
       if (run) {
+        owningRunId = run._id;
         await ctx.scheduler.runAfter(0, internal.email.checkCollectQuotesDone, {
           runId: run._id,
           reason: "reply",
         });
       }
+    }
+
+    if (owningRunId) {
+      const distributor = await ctx.db.get(recipient.distributorId);
+      await ctx.db.insert("agentEvents", {
+        runId: owningRunId,
+        at: Date.now(),
+        kind: "quote_received",
+        summary: `Inbound reply from ${distributor?.name ?? "a distributor"}.`,
+        recipientId: rfpRecipientId,
+        distributorName: distributor?.name,
+      });
     }
 
     return { quoteId };
@@ -261,8 +275,17 @@ export const parseInboundQuote = internalAction({
       missingInfo: extraction.missingInfo,
     });
 
-    // Debounced recommendation regeneration: live updates as replies arrive.
     if (runId) {
+      const linesCount = parsedLineItems.length;
+      const missingTag = extraction.missingInfo ? " (missing info)" : "";
+      await ctx.runMutation(internal.agent.appendAgentEvent, {
+        runId,
+        kind: "quote_parsed",
+        summary: `Parsed ${distributorName} reply: ${linesCount} line${linesCount === 1 ? "" : "s"}, ${extraction.parseConfidence} confidence${missingTag}.`,
+        distributorName,
+      });
+
+      // Debounced recommendation regeneration: live updates as replies arrive.
       await ctx.scheduler.runAfter(
         RECOMMENDATION_DEBOUNCE_MS,
         internal.agent.generateRecommendation,

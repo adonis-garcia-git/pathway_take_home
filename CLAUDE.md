@@ -81,6 +81,10 @@ Required:
 - `GOOGLE_PLACES_API_KEY` — Places New Text Search (Convex env).
 - `NEXT_PUBLIC_CONVEX_URL`, `CONVEX_DEPLOYMENT` — written by `npx convex dev`.
 
+Optional:
+
+- `AGENT_TIME_SCALE` — compresses the agent's autonomous timings for demo runs. `1` (default) is production: 30-min nudges, 3-day RFP deadline. `60` is demo: ~30s nudges, ~72min deadline. Only the self-scheduling path is scaled; the heartbeat cron stays at 5 minutes. Set in the Convex env, not `.env.local`.
+
 Maileroo inbound: **no signing secret exists**. Authenticity is confirmed by calling the payload's `validation_url` once. Do not invent an env var for this.
 
 ## Glossary
