@@ -24,6 +24,11 @@ import {
 import { required } from "./env";
 
 const MODEL = "claude-sonnet-4-6";
+// Haiku 4.5 is ~3x faster than Sonnet for bounded structured extraction
+// and reliable enough for menu / quote parsing. Reserved for high-volume,
+// well-bounded tasks. Slower-but-stronger Sonnet stays for synthesis tasks
+// like the recommendation rationale.
+const FAST_MODEL = "claude-haiku-4-5-20251001";
 const MAX_TOKENS = 8192;
 
 type ContentBlock =
@@ -64,6 +69,9 @@ interface ForcedToolCallOptions<S extends z.ZodTypeAny> {
   systemPrompt: string;
   outputSchema: S;
   content: MenuContent;
+  // Optional per-call model override. Defaults to MODEL (Sonnet 4.6).
+  // Pass FAST_MODEL for bounded structured tasks where latency matters.
+  model?: string;
 }
 
 /**
@@ -93,12 +101,13 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
     },
   ];
 
-  // 90s deadline (Claude with tool-use on multimodal menus can run long);
-  // 1 retry on overload (529) or transient network errors. 4xx is permanent.
-  // We pass `signal` so the underlying fetch is actually cancelled on
-  // timeout, not left dangling (Convex flags dangling promises).
+  // 120s deadline. Claude with tool-use on long multimodal/text content can
+  // run long; Haiku at ~30KB usually returns in well under 30s but we keep
+  // headroom for Sonnet rationale calls. We pass `signal` so the underlying
+  // fetch is actually cancelled on timeout, not left dangling.
+  const modelToUse = opts.model ?? MODEL;
   const callClaude = async (messages: Anthropic.Messages.MessageParam[]) => {
-    const TIMEOUT_MS = 90_000;
+    const TIMEOUT_MS = 120_000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
@@ -107,7 +116,7 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
       // cleanup, producing "The stream is not in a state that permits close".
       return await client.messages.create(
         {
-          model: MODEL,
+          model: modelToUse,
           max_tokens: MAX_TOKENS,
           system: opts.systemPrompt,
           tools: [tool],
@@ -135,7 +144,9 @@ async function forcedToolCall<S extends z.ZodTypeAny>(
       baseMs: 500,
       label: "anthropic.messages.create",
       retryOn: (err) => {
-        if (err instanceof Error && err.name === "TimeoutError") return true;
+        // Do NOT retry on TimeoutError. If Claude took >120s once, retrying
+        // with the exact same input is almost certain to time out again and
+        // burns another 120s budget. Surface the timeout to the caller.
         // SDK / runtime race during stream cleanup. Idempotent retry.
         if (
           err instanceof TypeError &&
@@ -235,15 +246,65 @@ Always call the record_menu tool to return results. Never reply with prose.
 
 ${NO_EM_DASH_RULE}`;
 
+const MENU_TOOL_DESCRIPTION =
+  "Record the structured menu extraction. Must include every dish (skip section headers) with per-serving ingredient estimates.";
+
+const NO_MENU_FOUND_MESSAGE =
+  "Could not find menu content on this page. The URL might not include the menu directly, or the page might rely on JavaScript to render content the static fetch cannot see. Try the direct menu URL, or use Paste Text and copy the menu in.";
+
+function looksLikeStructuredOutputFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    /failed validation/i.test(err.message) ||
+    /did not call/i.test(err.message) ||
+    /dishes: required/i.test(err.message)
+  );
+}
+
 export async function extractMenu(content: MenuContent): Promise<MenuExtraction> {
-  return forcedToolCall({
-    toolName: "record_menu",
-    toolDescription:
-      "Record the structured menu extraction. Must include every dish (skip section headers) with per-serving ingredient estimates.",
-    systemPrompt: MENU_SYSTEM,
-    outputSchema: MenuExtractionSchema,
-    content,
-  });
+  // Two-stage strategy. Haiku 4.5 is faster but its forced tool-use on a
+  // nested schema can occasionally produce empty/malformed output. On any
+  // structured-output failure (validation, no tool call), we transparently
+  // fall back to Sonnet, which is more reliable on complex schemas. If
+  // both fail OR succeed with zero dishes, surface a clean user-visible
+  // error rather than letting the run silently continue with no data.
+  let extraction: MenuExtraction | null = null;
+
+  try {
+    extraction = await forcedToolCall({
+      toolName: "record_menu",
+      toolDescription: MENU_TOOL_DESCRIPTION,
+      systemPrompt: MENU_SYSTEM,
+      outputSchema: MenuExtractionSchema,
+      content,
+      model: FAST_MODEL,
+    });
+  } catch (haikuErr) {
+    if (!looksLikeStructuredOutputFailure(haikuErr)) throw haikuErr;
+    console.warn(
+      `[extractMenu] Haiku failed structured output (${haikuErr instanceof Error ? haikuErr.message : "unknown"}); retrying with Sonnet.`,
+    );
+    try {
+      extraction = await forcedToolCall({
+        toolName: "record_menu",
+        toolDescription: MENU_TOOL_DESCRIPTION,
+        systemPrompt: MENU_SYSTEM,
+        outputSchema: MenuExtractionSchema,
+        content,
+        model: MODEL,
+      });
+    } catch (sonnetErr) {
+      if (looksLikeStructuredOutputFailure(sonnetErr)) {
+        throw new Error(NO_MENU_FOUND_MESSAGE);
+      }
+      throw sonnetErr;
+    }
+  }
+
+  if (extraction.dishes.length === 0) {
+    throw new Error(NO_MENU_FOUND_MESSAGE);
+  }
+  return extraction;
 }
 
 // ── parseQuoteReply (Phase 6) ────────────────────────────────────
@@ -289,6 +350,7 @@ export async function parseQuoteReply(
     systemPrompt: QUOTE_SYSTEM,
     outputSchema: QuoteExtractionSchema,
     content,
+    model: FAST_MODEL,
   });
 }
 
@@ -339,5 +401,129 @@ export async function writeRecommendationRationale(
     systemPrompt: RATIONALE_SYSTEM,
     outputSchema: RecommendationRationaleSchema,
     content,
+  });
+}
+
+// ── generateDistributorReply (Phase 18 demo) ────────────────────
+//
+// Plain-text Claude call (no tool use). Produces a realistic distributor
+// reply body for the demoLlmReplyForRun simulator. Per-line target prices
+// are passed in the prompt so the downstream recommendation engine still
+// lands a clear winner within the chosen margin band.
+
+const DISTRIBUTOR_REPLY_SYSTEM = `You are role-playing a wholesale food distributor replying to an RFP from a small restaurant. Write a SHORT plain-text email reply, no greeting line beyond "Hi" or similar, no signature block beyond your distributor name on the last line.
+
+Quote every basket line at the exact target price you are given. Keep units exact (lb, L, dozen, each). Vary your format and tone naturally across calls: a dash list, a numbered list, or short prose are all fine, pick one per reply. Do not invent new line items, do not change names.
+
+Include payment and delivery terms at the end as a short prose line.
+
+If the input says omitOneLine is true, pick the most specialty-sounding line in the basket (rare cheese, imported oil, specialty cut) and instead of pricing it write "currently checking with our supplier, will follow up shortly" or equivalent. Do not omit more than one.
+
+End with the distributor's name on its own last line. Do not include subject lines, headers, or quoted reply chains.
+
+${NO_EM_DASH_RULE}`;
+
+export interface DistributorReplyInput {
+  distributorName: string;
+  distributorCategories: string[];
+  restaurantName: string;
+  basketLines: {
+    canonicalName: string;
+    quantity: number;
+    unit: string;
+    targetPricePerUnit: number;
+  }[];
+  termsHint: "primary" | "secondary" | "competitor";
+  omitOneLine: boolean;
+}
+
+/**
+ * Generate one distributor-voiced reply via Claude (Haiku) and return the
+ * raw email body. Never throws inside the action that calls it; the caller
+ * should catch and fall back to a templated reply on failure if desired.
+ */
+export async function generateDistributorReply(
+  input: DistributorReplyInput,
+): Promise<string> {
+  const apiKey = required("ANTHROPIC_API_KEY");
+  const client = new Anthropic({ apiKey, maxRetries: 0 });
+
+  const termsGuide =
+    input.termsHint === "primary"
+      ? "Terms preference: Net 30, daily delivery, $250 minimum order. You are a confident high-volume supplier."
+      : input.termsHint === "secondary"
+        ? "Terms preference: Net 30, Mon/Wed/Fri delivery, $300 minimum order. You are a specialty supplier with strong selection."
+        : "Terms preference: Net 15, weekly delivery, $400 minimum order. You are a smaller competitor and your prices reflect that.";
+
+  const basketBlock = input.basketLines
+    .map(
+      (l) =>
+        `- ${l.canonicalName} (${l.quantity} ${l.unit}/wk): target $${l.targetPricePerUnit.toFixed(2)}/${l.unit}`,
+    )
+    .join("\n");
+
+  const userPrompt = [
+    `DISTRIBUTOR: ${input.distributorName}`,
+    `CATEGORIES: ${input.distributorCategories.join(", ") || "general"}`,
+    `RESTAURANT: ${input.restaurantName}`,
+    termsGuide,
+    `omitOneLine: ${input.omitOneLine}`,
+    "",
+    "BASKET (quote at the target price per unit):",
+    basketBlock,
+    "",
+    "Write the reply body now.",
+  ].join("\n");
+
+  const TIMEOUT_MS = 60_000;
+  const callOnce = async (): Promise<string> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const res = await client.messages.create(
+        {
+          model: FAST_MODEL,
+          max_tokens: 1024,
+          system: DISTRIBUTOR_REPLY_SYSTEM,
+          messages: [{ role: "user", content: userPrompt }],
+        },
+        { signal: controller.signal },
+      );
+      const text = res.content
+        .filter((b): b is Anthropic.Messages.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      if (!text) throw new Error("empty reply body from Claude");
+      return text;
+    } catch (err) {
+      if (
+        controller.signal.aborted ||
+        (err instanceof Error &&
+          (err.name === "AbortError" || err.name === "APIUserAbortError"))
+      ) {
+        throw new TimeoutError("anthropic.generateDistributorReply", TIMEOUT_MS);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  return withRetry(callOnce, {
+    attempts: 2,
+    baseMs: 500,
+    label: "anthropic.generateDistributorReply",
+    retryOn: (err) => {
+      if (
+        err instanceof TypeError &&
+        /stream is not in a state that permits close/i.test(err.message)
+      ) {
+        return true;
+      }
+      const status = (err as { status?: number })?.status;
+      if (typeof status === "number") return status === 529 || status >= 500;
+      return false;
+    },
   });
 }

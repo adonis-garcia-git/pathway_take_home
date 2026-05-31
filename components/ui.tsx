@@ -264,11 +264,17 @@ export const Field = (p: React.InputHTMLAttributes<HTMLInputElement>) =>
 export const TextArea = (p: React.TextareaHTMLAttributes<HTMLTextAreaElement>) =>
   <textarea className={cn("w-full bg-surface border border-border-strong rounded-md px-3.5 py-3 text-[14.5px] text-ink placeholder:text-faint leading-relaxed resize-y focus:outline-none focus:border-forest focus:ring-[3px] focus:ring-forest/25 transition", p.className)} {...p} />;
 
-export function IconField({ icon, ...p }: { icon: React.ReactNode } & React.InputHTMLAttributes<HTMLInputElement>) {
+export function IconField({ icon, className, ...p }: { icon: React.ReactNode } & React.InputHTMLAttributes<HTMLInputElement>) {
   return (
-    <div className="flex items-center gap-2.5 bg-surface border border-border-strong rounded-md px-3.5 focus-within:border-forest focus-within:ring-[3px] focus-within:ring-forest/25 transition">
-      <span className="text-muted">{icon}</span>
-      <input className="flex-1 border-0 outline-none bg-transparent text-[14.5px] text-ink placeholder:text-faint py-3" {...p} />
+    <div className="flex items-center gap-2.5 w-full bg-surface border border-border-strong rounded-md px-3.5 focus-within:border-forest focus-within:ring-[3px] focus-within:ring-forest/25 transition">
+      <span className="text-muted shrink-0">{icon}</span>
+      <input
+        {...p}
+        className={cn(
+          "flex-1 min-w-0 w-full border-0 outline-none bg-transparent text-[14.5px] text-ink placeholder:text-faint py-3",
+          className,
+        )}
+      />
     </div>
   );
 }

@@ -45,6 +45,12 @@ export const runCollectQuotes = internalAction({
         reason: "deadline",
       });
 
+      // Demo-mode auto-completion: as soon as Stage 5 opens, schedule the
+      // fast templated simulator. It writes inbound quotes via the same
+      // recordInboundQuote path the real webhook uses, idempotently. The
+      // action is a no-op when DISABLE_DEMO_CONTROLS=1 (production safety).
+      await ctx.scheduler.runAfter(0, internal.email.autoSimulateReplies, { runId });
+
       // Also run an immediate reply-mode check in case every recipient is
       // already terminal (mock send + simulator workflow can finish before
       // we ever schedule the deadline).

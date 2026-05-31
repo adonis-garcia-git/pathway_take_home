@@ -173,12 +173,27 @@ export function LivePipeline({ runId }: { runId: Id<"pipelineRuns"> }) {
 
   const runningIdx = phases.findIndex((p) => p === "running");
   const errorIdx = phases.findIndex((p) => p === "error");
-  const lastNonPending = phases.reduce(
-    (acc, p, i) => (p !== "pending" ? i : acc),
-    0,
+  const lastDoneIdx = phases.reduce(
+    (acc, p, i) => (p === "done" ? i : acc),
+    -1,
   );
+  // After the last done stage, prefer the NEXT stage (whatever its phase)
+  // so the user lands on the panel where the next action lives. This
+  // matters most for Stage 5: between Stage 4 finishing and Stage 5
+  // transitioning to "running" the auto-select used to park on Stage 4
+  // (no simulate button); now it advances to Stage 5.
+  const nextAfterDone =
+    lastDoneIdx >= 0 && lastDoneIdx < STAGE_KEYS.length - 1
+      ? lastDoneIdx + 1
+      : lastDoneIdx;
   const autoIdx =
-    errorIdx >= 0 ? errorIdx : runningIdx >= 0 ? runningIdx : lastNonPending;
+    errorIdx >= 0
+      ? errorIdx
+      : runningIdx >= 0
+        ? runningIdx
+        : nextAfterDone >= 0
+          ? nextAfterDone
+          : 0;
   const selIdx = userSel != null ? userSel : autoIdx;
 
   const completed = phases.filter((p) => p === "done").length;
@@ -315,12 +330,11 @@ function StageNode({
 
   return (
     <button
-      disabled={phase === "pending"}
       onClick={onClick}
       className={cn(
         "flex items-start gap-3 text-left bg-surface border rounded-md p-[13px_14px] transition w-full",
         phase === "pending"
-          ? "opacity-55 bg-surface-2 cursor-default"
+          ? "opacity-55 bg-surface-2 cursor-pointer hover:opacity-80"
           : "cursor-pointer hover:-translate-y-px",
         phase === "running"
           ? "border-st-running/50 shadow-[0_0_0_3px_var(--color-st-running-bg)]"

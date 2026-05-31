@@ -35,8 +35,18 @@ async function safeBody(res: Response): Promise<string | undefined> {
 
 export function stripHtml(html: string): string {
   let s = html;
+  // Drop entire noise blocks before generic tag stripping. Order matters:
+  // these regexes are non-greedy so they only eat their own block.
   s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
   s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  s = s.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+  s = s.replace(/<svg[\s\S]*?<\/svg>/gi, " ");
+  s = s.replace(/<picture[\s\S]*?<\/picture>/gi, " ");
+  s = s.replace(/<nav[\s\S]*?<\/nav>/gi, " ");
+  s = s.replace(/<header[\s\S]*?<\/header>/gi, " ");
+  s = s.replace(/<footer[\s\S]*?<\/footer>/gi, " ");
+  s = s.replace(/<aside[\s\S]*?<\/aside>/gi, " ");
+  s = s.replace(/<form[\s\S]*?<\/form>/gi, " ");
   s = s.replace(/<!--[\s\S]*?-->/g, " ");
   s = s.replace(/<\/(p|div|li|tr|h\d|br)>/gi, "\n");
   s = s.replace(/<br\s*\/?>(\s)*/gi, "\n");

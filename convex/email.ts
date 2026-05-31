@@ -13,7 +13,7 @@
 
 import { v } from "convex/values";
 import { internalAction, internalMutation, internalQuery, action, mutation, query } from "./_generated/server";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { optional } from "./lib/env";
 import { replyAddressFor } from "./lib/replyAddress";
@@ -23,6 +23,8 @@ import { sumOccurrences } from "./lib/units";
 import { STEPS } from "./lib/stepKeys";
 import { RFP_DEADLINE_MS } from "./lib/agentConstants";
 import { demoPriceFor, demoUnitFor } from "./lib/demoPricing";
+import { generateDistributorReply } from "./lib/anthropic";
+import { runWithConcurrency } from "./lib/concurrency";
 
 // ─── Internal mutations: idempotent recipient writes ────────────────
 
@@ -859,6 +861,107 @@ export const demoReplyForRun = action({
 });
 
 /**
+ * Demo flavor #2: ask Claude (Haiku) to write each distributor's reply
+ * as varied prose, then route it through the same recordInboundQuote
+ * webhook the real Maileroo inbound flow uses. Per-line target prices
+ * are passed in the prompt so the recommendation engine still lands a
+ * clear winner within the 4 to 6 percent margin band.
+ *
+ * Idempotent: mailerooMessageId = "demo-llm:{recipientId}". Re-clicks
+ * are no-ops for recipients that already replied via this path.
+ */
+export const demoLlmReplyForRun = action({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (
+    ctx,
+    { runId },
+  ): Promise<{ replied: number; skipped: number }> => {
+    const profiles: RecipientDemoProfile[] = await ctx.runQuery(
+      internal.email.demoProfilesForRun,
+      { runId },
+    );
+
+    const run = await ctx.runQuery(internal.email.getRunForSend, { runId });
+    if (!run) return { replied: 0, skipped: 0 };
+    const restaurant = await ctx.runQuery(internal.email.getRestaurant, {
+      restaurantId: run.restaurantId,
+    });
+    const restaurantName = restaurant?.name ?? "the restaurant";
+
+    const ordered = [...profiles].sort(
+      (a, b) =>
+        b.categoryCount - a.categoryCount ||
+        b.lines.length - a.lines.length ||
+        a.distributorName.localeCompare(b.distributorName),
+    );
+
+    type Task = {
+      profile: RecipientDemoProfile;
+      bias: number;
+      termsHint: "primary" | "secondary" | "competitor";
+      omitOneLine: boolean;
+    };
+
+    const tasks: Task[] = ordered.map((p, i) => {
+      const bias =
+        i === 0 ? 0.96 : i === 1 ? 0.99 : 1.02 + Math.min(0.08, 0.01 * (i - 2));
+      const termsHint: Task["termsHint"] =
+        i === 0 ? "primary" : i === 1 ? "secondary" : "competitor";
+      // Predictably trigger missing-info on the third recipient so the
+      // follow-up path is visible during the demo walkthrough.
+      const omitOneLine = i === 2 && p.lines.length >= 4;
+      return { profile: p, bias, termsHint, omitOneLine };
+    });
+
+    let replied = 0;
+    let skipped = 0;
+
+    await runWithConcurrency(tasks, 4, async (task) => {
+      const p = task.profile;
+      if (p.lines.length === 0) {
+        skipped += 1;
+        return;
+      }
+      try {
+        const basketLines = p.lines.map((line) => ({
+          canonicalName: line.canonicalName,
+          quantity: line.quantity,
+          unit: demoUnitFor(line.canonicalName),
+          targetPricePerUnit: demoPriceFor(
+            line.canonicalName,
+            line.category,
+            task.bias,
+          ),
+        }));
+        const body = await generateDistributorReply({
+          distributorName: p.distributorName,
+          distributorCategories: [], // category list isn't on the profile; not critical
+          restaurantName,
+          basketLines,
+          termsHint: task.termsHint,
+          omitOneLine: task.omitOneLine,
+        });
+        const messageId = `demo-llm:${p.recipientId}`;
+        await ctx.runMutation(internal.quotes.recordInboundQuote, {
+          rfpRecipientId: p.recipientId,
+          mailerooMessageId: messageId,
+          rawEmailBody: body,
+        });
+        replied += 1;
+      } catch (e) {
+        skipped += 1;
+        console.error(
+          `[demoLlmReplyForRun] generation failed for recipient ${p.recipientId}:`,
+          e,
+        );
+      }
+    });
+
+    return { replied, skipped };
+  },
+});
+
+/**
  * Emergency: force collect_quotes to "done" without waiting for the
  * deadline timer. Use if stage 5 hangs after replies have all landed but
  * the checkCollectQuotesDone chain didn't fire. Idempotent.
@@ -901,6 +1004,28 @@ function assertDemoMode() {
     throw new Error("Demo controls disabled");
   }
 }
+
+/**
+ * Internal action scheduled at the start of Stage 5 (collect_quotes). On
+ * demo deploys, fires the fast templated simulator immediately so the
+ * pipeline self-completes without the grader clicking anything. Same
+ * idempotent inbound writes as the public button; safe if the user also
+ * clicks Simulate manually (mailerooMessageId dedupe).
+ *
+ * Skips silently when DISABLE_DEMO_CONTROLS=1 so a production deploy
+ * doesn't auto-fabricate fake replies.
+ */
+export const autoSimulateReplies = internalAction({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }): Promise<{ skipped: boolean; replied?: number }> => {
+    if (process.env.DISABLE_DEMO_CONTROLS === "1") {
+      return { skipped: true };
+    }
+    const result = await ctx.runAction(api.email.demoReplyForRun, { runId });
+    console.log(`[autoSimulateReplies] runId=${runId} replied=${result.replied}`);
+    return { skipped: false, replied: result.replied };
+  },
+});
 
 /**
  * Simulate an inbound reply that is missing prices on 2-3 lines, so the

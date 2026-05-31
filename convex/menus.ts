@@ -349,16 +349,31 @@ export const runParseMenuAction = internalAction({
     if (menu.sourceType === "text") {
       content = [{ type: "text", text: menu.rawSource }];
     } else if (menu.sourceType === "url") {
-      const text = await fetchUrlAsText(menu.rawSource);
+      const rawText = await fetchUrlAsText(menu.rawSource);
+      const trimmed = rawText.trim();
       // Many modern restaurant sites are JavaScript SPAs. After stripping
       // tags the static HTML can be empty or near-empty. Catch that here
       // with a clear error instead of letting Claude come back with an
       // empty dishes array.
-      if (text.trim().length < 200) {
+      if (trimmed.length < 200) {
         throw new Error(
-          `URL returned too little usable text (${text.trim().length} chars after stripping HTML). The page may be a JavaScript SPA. Paste the menu text directly instead.`,
+          `URL returned too little usable text (${trimmed.length} chars after stripping HTML). The page may be a JavaScript SPA. Paste the menu text directly instead.`,
         );
       }
+      // Cap input to keep Claude's processing time bounded. Restaurant pages
+      // routinely run 100-300KB after stripping (chain footers, repeated
+      // menu sections, terms-of-service blocks). 40KB is roughly 10K tokens,
+      // which fits Haiku's structured-output budget with headroom while
+      // capturing the visible menu content that lives near the top of the
+      // page.
+      const MAX_INPUT_CHARS = 40_000;
+      const text =
+        trimmed.length > MAX_INPUT_CHARS
+          ? `${trimmed.slice(0, MAX_INPUT_CHARS)}\n\n[truncated: ${trimmed.length - MAX_INPUT_CHARS} more characters omitted]`
+          : trimmed;
+      console.log(
+        `[parseMenu] URL fetch yielded ${trimmed.length} chars after strip; sending ${text.length} chars to Claude.`,
+      );
       content = [
         {
           type: "text",
