@@ -785,24 +785,15 @@ export function QuotesPanel({
   error?: string;
 }) {
   if (phase === "error") return <ErrorArm error={error} Icon={Award} />;
-  // SimulateRepliesCard is always the first thing in Stage 5 regardless of
-  // phase, loading state, or whether a recommendation already exists. The
-  // card decides for itself whether to be enabled (running/done) or
-  // disabled-with-explanation (pending).
-  return (
-    <div className="flex flex-col gap-4">
-      <SimulateRepliesCard runId={runId} phase={phase} />
-      {phase === "pending" ? (
-        <EmptyState
-          Icon={Award}
-          title="Stage 5 has not started yet"
-          body="Once Stage 4 finishes queuing RFPs, Stage 5 opens and quotes start landing here. Use the Simulate button above to skip the wait once Stage 4 is done."
-        />
-      ) : (
-        <QuotesBody runId={runId} />
-      )}
-    </div>
-  );
+  if (phase === "pending")
+    return (
+      <EmptyState
+        Icon={Award}
+        title="Stage 5 is opening"
+        body="Patty is wiring up the inbound flow. Quotes start landing here automatically as soon as Stage 4 finishes queuing RFPs."
+      />
+    );
+  return <QuotesBody runId={runId} />;
 }
 
 function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
@@ -917,135 +908,13 @@ function QuotesBody({ runId }: { runId: Id<"pipelineRuns"> }) {
   );
 }
 
-type SimStatus =
-  | { kind: "idle" }
-  | { kind: "running"; via: "fast" | "llm" }
-  | { kind: "done"; via: "fast" | "llm"; replied: number; skipped?: number }
-  | { kind: "error"; via: "fast" | "llm"; message: string };
-
-function SimulateRepliesCard({
-  runId,
-  phase,
-}: {
-  runId: Id<"pipelineRuns">;
-  phase: Phase;
-}) {
-  const demoReply = useAction(api.email.demoReplyForRun);
-  const demoLlmReply = useAction(api.email.demoLlmReplyForRun);
-  const [status, setStatus] = useState<SimStatus>({ kind: "idle" });
-
-  const stageNotReady = phase === "pending";
-  const inFlight = status.kind === "running";
-  const disabled = stageNotReady || inFlight;
-
-  const run = async (via: "fast" | "llm") => {
-    if (disabled) return;
-    setStatus({ kind: "running", via });
-    try {
-      if (via === "fast") {
-        const r = await demoReply({ runId });
-        setStatus({ kind: "done", via, replied: r.replied });
-      } else {
-        const r = await demoLlmReply({ runId });
-        setStatus({ kind: "done", via, replied: r.replied, skipped: r.skipped });
-      }
-    } catch (e) {
-      setStatus({
-        kind: "error",
-        via,
-        message: e instanceof Error ? e.message : String(e),
-      });
-    }
-  };
-
-  const headline = stageNotReady
-    ? "Demo replies (queued for Stage 5)"
-    : "Skip the wait. Simulate distributor replies.";
-  const bodyText = stageNotReady
-    ? "Stage 5 has not started yet. Once Patty finishes sending RFPs, both buttons below will simulate every distributor replying with priced quotes so you can see the recommendation."
-    : "Real inbound RFP replies land here via Maileroo. For a grading walkthrough, pick either button. Fast uses a deterministic template per distributor and lands in under 10 seconds. Realistic asks Claude to write each distributor's reply prose for you and lands in 15 to 30 seconds; open Stage 4 afterward to read the generated bodies in the email preview. Re-clicks are idempotent.";
-
-  const fastLabel =
-    inFlight && status.via === "fast"
-      ? "Simulating..."
-      : status.kind === "done" && status.via === "fast"
-        ? "Run another round (fast)"
-        : "Simulate distributor replies (fast)";
-  const llmLabel =
-    inFlight && status.via === "llm"
-      ? "Generating via Claude..."
-      : status.kind === "done" && status.via === "llm"
-        ? "Generate another round (Claude)"
-        : "Generate Claude-written replies";
-
-  return (
-    <Card pad className="border-patty/30 bg-mint/40">
-      <div className="flex items-start gap-3">
-        <Clock size={18} className="text-st-running mt-0.5 shrink-0" />
-        <div className="flex-1 min-w-0">
-          <div className="text-[14px] font-medium text-ink mb-1">{headline}</div>
-          <p className="text-[12.5px] text-ink-2 leading-relaxed mb-3">{bodyText}</p>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => run("fast")}
-              disabled={disabled}
-              title={stageNotReady ? "Available once Stage 4 finishes sending RFPs." : undefined}
-            >
-              {fastLabel}
-            </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => run("llm")}
-              disabled={disabled}
-              title={
-                stageNotReady
-                  ? "Available once Stage 4 finishes sending RFPs."
-                  : "Calls Claude per recipient to write a distributor-voiced reply. ~15-30s."
-              }
-            >
-              {llmLabel}
-            </Button>
-          </div>
-          {status.kind === "done" && (
-            <p className="font-mono text-[11.5px] text-forest mt-2">
-              {status.replied} distributor {status.replied === 1 ? "reply" : "replies"} processed
-              {status.skipped && status.skipped > 0
-                ? ` (${status.skipped} skipped on error)`
-                : ""}
-              . Parsing now.
-              {status.via === "llm" && (
-                <span className="text-muted">
-                  {" "}Open Stage 4 to see the generated bodies in the email preview.
-                </span>
-              )}
-            </p>
-          )}
-          {status.kind === "error" && (
-            <p className="font-mono text-[11.5px] text-st-error mt-2">
-              {status.via === "llm" ? "Claude reply generation" : "Simulation"} failed: {status.message}
-            </p>
-          )}
-          <p className="text-[11px] text-muted mt-3 leading-relaxed">
-            For finer-grained agent behaviors (missing-info follow-up, no-reply nudge, force tick), open the Demo controls panel below.
-          </p>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
 function DemoControls({ runId }: { runId: Id<"pipelineRuns"> }) {
-  // Open by default: the simulate-replies button inside this expander is a
-  // critical second path to the headline demo action and must be visible
-  // on first render of Stage 5.
+  // Open by default so the agent-behavior buttons are visible on first
+  // render of Stage 5. The headline simulate path now runs automatically
+  // via autoSimulateReplies; these buttons exercise edge cases.
   const [open, setOpen] = useState(true);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const demoReply = useAction(api.email.demoReplyForRun);
-  const demoLlmReply = useAction(api.email.demoLlmReplyForRun);
   const demoMissingInfo = useAction(api.email.demoMissingInfoReplyForRecipient);
   const demoStale = useMutation(api.email.demoMarkRecipientStale);
   const forceTick = useAction(api.email.forceTick);
@@ -1072,7 +941,7 @@ function DemoControls({ runId }: { runId: Id<"pipelineRuns"> }) {
         <span className="flex items-center gap-2.5">
           <Search size={15} className="text-muted" />
           <span className="text-[13.5px] font-medium text-ink">Demo controls</span>
-          <span className="font-mono text-[11px] text-faint">exercise agent behaviors without the 5 min cron</span>
+          <span className="font-mono text-[11px] text-faint">exercise agent behaviors (follow-ups, nudges, tick)</span>
         </span>
         <ChevronRight
           size={16}
@@ -1082,26 +951,6 @@ function DemoControls({ runId }: { runId: Id<"pipelineRuns"> }) {
       {open && (
         <div className="mt-3 pt-3 border-t border-border flex flex-col gap-2">
           <div className="flex flex-wrap gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={busy}
-              onClick={() =>
-                run("Simulate distributor replies", () => demoReply({ runId }))
-              }
-            >
-              Simulate distributor replies (fast)
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={busy}
-              onClick={() =>
-                run("Generate Claude-written replies", () => demoLlmReply({ runId }))
-              }
-            >
-              Generate Claude-written replies
-            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -1130,7 +979,7 @@ function DemoControls({ runId }: { runId: Id<"pipelineRuns"> }) {
             </Button>
           </div>
           <p className="text-[11.5px] text-muted leading-relaxed">
-            These actions are dev-only affordances. The first two simulate inbound conditions on a real recipient. The third runs the agent loop immediately so follow-ups and nudges fire without waiting for the heartbeat. Watch Patty&apos;s notebook below to see the events appear.
+            These actions exercise the agent&apos;s missing-info follow-up, no-reply nudge, and immediate tick paths without waiting for the 5 minute heartbeat. Watch Patty&apos;s notebook below to see the events fire.
           </p>
           {status && (
             <p className="font-mono text-[11px] text-ink-2 bg-surface-3 border border-border rounded px-2 py-1">

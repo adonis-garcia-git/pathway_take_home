@@ -836,9 +836,30 @@ export const demoReplyForRun = action({
             ? "Net 30, Mon/Wed/Fri delivery, $300 min order."
             : "Net 15, weekly delivery, $400 min order.";
 
+      // Differentiate lead times by rank so the comparison table has real
+      // values to surface. Primary (high-volume) ships next-day; specialty
+      // secondary takes 2 days; competitors run on a weekly schedule.
+      const leadTime =
+        i === 0
+          ? "24 hours"
+          : i === 1
+            ? "2 business days"
+            : "3 to 5 business days";
+
+      // Compute a stated weekly total so the parser sees one explicitly.
+      // The recommendation engine will use it directly instead of falling
+      // back to its derived total.
+      const weeklyTotal = linesToQuote.reduce((sum, line) => {
+        const price = demoPriceFor(line.canonicalName, line.category, bias);
+        return sum + price * line.quantity;
+      }, 0);
+      const totalStr = `$${(Math.round(weeklyTotal * 100) / 100).toFixed(2)}`;
+
       const body =
         `Hi, thanks for the RFP. Pricing per line as requested:\n` +
         `${itemLines}\n\n` +
+        `Total estimated weekly basket: ${totalStr}.\n` +
+        `Lead time: ${leadTime}.\n` +
         `Terms: ${terms}\n\n` +
         `${p.distributorName}`;
 

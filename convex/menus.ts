@@ -328,7 +328,12 @@ export const writeParseResult = internalMutation({
     const needsReviewCount = extr.dishes.filter((d) => d.needsReview).length;
     return {
       dishesWritten: extr.dishes.length,
-      ingredientsWritten: ingredientRows,
+      // Unique canonical ingredients in this menu's basket. Matches the
+      // "ingredient lines" stat the main RecipesPanel shows. Previously
+      // returned `ingredientRows` (count of NEW master inserts), which
+      // collapsed to zero on re-runs and produced the "0 ingredients"
+      // sidebar bug.
+      ingredientsWritten: aggregated.length,
       dishIngredientsWritten: dishIngredientRows,
       needsReviewCount,
     };

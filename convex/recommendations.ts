@@ -71,6 +71,13 @@ export const comparisonTable = query({
     if (!rfp) return [];
 
     const itemsTotal = rfp.ingredientList.length;
+    // Per-ingredient basket quantities so we can derive a weekly total when
+    // the distributor didn't state one explicitly. Real procurement does
+    // this computation; the parser only captures what the email said.
+    const qtyByIngredient = new Map<string, number>();
+    for (const line of rfp.ingredientList) {
+      qtyByIngredient.set(line.ingredientId as unknown as string, line.quantity);
+    }
     const recipients = await ctx.db
       .query("rfpRecipients")
       .withIndex("by_rfpId", (q) => q.eq("rfpId", rfp._id))
@@ -89,10 +96,23 @@ export const comparisonTable = query({
       const quote = quotesForRecipient.sort((a, b) => b.receivedAt - a.receivedAt)[0];
 
       let itemsQuoted = 0;
+      let derivedTotal: number | undefined;
       if (quote) {
         itemsQuoted = quote.parsedLineItems.filter(
           (l) => l.available && typeof l.price === "number",
         ).length;
+        // Compute weekly total = sum over priced+available line items of
+        // (price × basket quantity for that ingredient). Falls back to 0 if
+        // we can't match. Used when quote.totalPrice is null/undefined.
+        let sum = 0;
+        for (const li of quote.parsedLineItems) {
+          if (!li.available) continue;
+          if (typeof li.price !== "number") continue;
+          if (!li.ingredientId) continue;
+          const qty = qtyByIngredient.get(li.ingredientId as unknown as string);
+          if (typeof qty === "number") sum += li.price * qty;
+        }
+        if (sum > 0) derivedTotal = Math.round(sum * 100) / 100;
       }
       const completePct = itemsTotal === 0 ? 0 : (itemsQuoted / itemsTotal) * 100;
 
@@ -102,7 +122,7 @@ export const comparisonTable = query({
         emailStatus: r.emailStatus,
         attempts: r.attempts,
         hasQuote: Boolean(quote),
-        totalPrice: quote?.totalPrice,
+        totalPrice: quote?.totalPrice ?? derivedTotal,
         itemsQuoted,
         itemsTotal,
         completePct,

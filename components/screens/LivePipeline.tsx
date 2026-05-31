@@ -228,7 +228,7 @@ export function LivePipeline({ runId }: { runId: Id<"pipelineRuns"> }) {
     : 0;
 
   return (
-    <div className="max-w-[1280px] mx-auto px-7 pt-[26px] pb-20">
+    <div className="max-w-[1600px] mx-auto px-7 pt-[26px] pb-20">
       <div className="flex items-end justify-between gap-6 max-md:flex-col max-md:items-stretch mb-[22px]">
         <div>
           <div className="flex items-baseline gap-3 mb-[9px]">

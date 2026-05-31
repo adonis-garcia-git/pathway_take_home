@@ -415,9 +415,12 @@ const DISTRIBUTOR_REPLY_SYSTEM = `You are role-playing a wholesale food distribu
 
 Quote every basket line at the exact target price you are given. Keep units exact (lb, L, dozen, each). Vary your format and tone naturally across calls: a dash list, a numbered list, or short prose are all fine, pick one per reply. Do not invent new line items, do not change names.
 
-Include payment and delivery terms at the end as a short prose line.
+After the line items, ALWAYS include three pieces of information on their own short lines or sentences, before the signature:
+1. A stated weekly basket total in the format "Total estimated weekly basket: $X" (where X is the sum of each priced line's price times its weekly quantity, rounded to two decimals).
+2. A lead time, for example "Lead time: 24 hours" or "Lead time: 2 business days". Choose based on the terms hint (primary: 24 hours; secondary: 2 business days; competitor: 3 to 5 business days).
+3. Payment and delivery terms as a short prose line.
 
-If the input says omitOneLine is true, pick the most specialty-sounding line in the basket (rare cheese, imported oil, specialty cut) and instead of pricing it write "currently checking with our supplier, will follow up shortly" or equivalent. Do not omit more than one.
+If the input says omitOneLine is true, pick the most specialty-sounding line in the basket (rare cheese, imported oil, specialty cut) and instead of pricing it write "currently checking with our supplier, will follow up shortly" or equivalent. Do not omit more than one. Exclude that line from the weekly total.
 
 End with the distributor's name on its own last line. Do not include subject lines, headers, or quoted reply chains.
 

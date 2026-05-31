@@ -110,7 +110,7 @@ export function StartScreen({ onRun }: { onRun: (runId: Id<"pipelineRuns">) => v
   ];
 
   return (
-    <div className="max-w-[1040px] mx-auto px-7 pt-16 pb-20">
+    <div className="max-w-[1280px] mx-auto px-7 pt-16 pb-20">
       <div className="text-center mb-11">
         <div className="inline-flex items-center gap-[7px] text-[12.5px] font-medium text-forest bg-mint border border-patty/40 rounded-full pl-2.5 pr-3 py-1.5 mb-[22px] whitespace-nowrap">
           <Patty size={15} /> Patty · RFP Pipeline
