@@ -10,8 +10,7 @@ Stack: **Next.js 15 App Router · TypeScript strict · Tailwind v4 · Convex · 
 
 ## Links
 
-- **Demo (Vercel):** _set after deploy_
-- **Loom walkthrough:** _set after recording_
+- **Loom walkthrough:** <https://www.loom.com/share/8326f289acb14cd2918bbccf1ae13aec>
 - **Loom script:** [`docs/loom-script.md`](./docs/loom-script.md)
 - **Project doctrine:** [`CLAUDE.md`](./CLAUDE.md)
 - **Design package:** [`design-reference/`](./design-reference/)
@@ -293,16 +292,6 @@ scripts/              check-em-dashes.mjs, demo.ts
 ## Tests
 
 `pnpm test` runs the Vitest suite covering pure helpers (USDA fuzzy match, pack normalization, recommendation scoring, demo pricing, em-dash check) and Convex action boundaries through `convex-test`. The current count is 61 passing. Test files live under `__tests__/` next to the code they exercise.
-
----
-
-## Deployment
-
-The app deploys cleanly to Vercel with platform defaults; no `vercel.json` or `vercel.ts` is needed. The flow:
-
-1. `npx convex deploy` from the repo root. Capture the production `NEXT_PUBLIC_CONVEX_URL` from the output.
-2. In Vercel, set `NEXT_PUBLIC_CONVEX_URL` as a project env var. Push the branch and Vercel will build with `pnpm build`.
-3. Convex secrets stay in the Convex env (`npx convex env set …`); they are never exposed to Vercel or the browser.
 
 ---
 
